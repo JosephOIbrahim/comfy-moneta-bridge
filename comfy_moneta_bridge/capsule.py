@@ -36,7 +36,12 @@ from pathlib import Path
 
 from moneta import Moneta, MonetaConfig
 
-from comfy_moneta_bridge.vector import DIMENSION, synthesize_vector
+from comfy_moneta_bridge.vector import (
+    DIMENSION,
+    encode_outcome,
+    from_env,
+    synthesize_vector,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -110,7 +115,14 @@ def write_capsule(
 
     Returns the path to the written capsule.
     """
-    embedding = synthesize_vector(session_name)
+    if from_env() == "bge":
+        # Capsule has only the session name to query with. Hand the BGE
+        # encoder a session-anchored stub so the query vector lands near
+        # same-session deposits; the payload-side ``session`` filter
+        # below catches anything cosine drags in from other sessions.
+        embedding = encode_outcome({"session": session_name})
+    else:
+        embedding = synthesize_vector(session_name)
     config = _build_config(moneta_storage_path)
 
     with Moneta(config) as m:

@@ -29,7 +29,12 @@ from pathlib import Path
 
 from moneta import Moneta, MonetaConfig
 
-from comfy_moneta_bridge.vector import DIMENSION, synthesize_vector
+from comfy_moneta_bridge.vector import (
+    DIMENSION,
+    encode_outcome,
+    from_env,
+    synthesize_vector,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -73,7 +78,10 @@ def ingest_outcome(outcome: dict, moneta_storage_path: Path) -> None:
         return
 
     session = outcome.get("session", "default")
-    embedding = synthesize_vector(session)
+    if from_env() == "bge":
+        embedding = encode_outcome(outcome)
+    else:
+        embedding = synthesize_vector(session)
     payload = json.dumps(outcome, sort_keys=True, ensure_ascii=False)
 
     config = _build_config(moneta_storage_path)
