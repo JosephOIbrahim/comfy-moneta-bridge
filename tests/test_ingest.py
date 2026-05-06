@@ -21,7 +21,14 @@ from pathlib import Path
 import pytest
 
 from comfy_moneta_bridge import ingest
-from comfy_moneta_bridge.vector import DIMENSION, synthesize_vector
+from comfy_moneta_bridge import vector as vector_mod
+from comfy_moneta_bridge.vector import (
+    DIMENSION,
+    EMBEDDER_VERSION_BGE,
+    EMBEDDER_VERSION_SYNTHETIC,
+    ENV_VAR,
+    synthesize_vector,
+)
 
 
 VALID_OUTCOME = {
@@ -117,11 +124,18 @@ def test_run_sleep_pass_called_after_deposit(tmp_path, patched_moneta) -> None:
 
 
 def test_payload_is_full_json(tmp_path, patched_moneta) -> None:
+    """Stored payload contains every original outcome field, plus the
+    embedder-version tag (default mode → synthetic-v0)."""
     outcome = _outcome()
     ingest.ingest_outcome(outcome, tmp_path / "moneta")
     payload, _embedding = patched_moneta.instances[0].deposit_calls[0]
     parsed = json.loads(payload)
-    assert parsed == outcome
+    # Every original outcome field round-trips verbatim.
+    for k, v in outcome.items():
+        assert parsed[k] == v, f"field {k!r} did not round-trip"
+    # Plus exactly one bridge-side decoration: the embedder version.
+    assert parsed["_embedder"] == EMBEDDER_VERSION_SYNTHETIC
+    assert set(parsed.keys()) - set(outcome.keys()) == {"_embedder"}
 
 
 def test_session_drives_embedding(tmp_path, patched_moneta) -> None:
@@ -171,6 +185,36 @@ def test_wrong_schema_version_dropped(tmp_path, patched_moneta, caplog) -> None:
     # No Moneta instance constructed at all.
     assert patched_moneta.instances == []
     assert any("schema_version" in r.message for r in caplog.records)
+
+
+def test_embedder_version_flips_with_env(
+    tmp_path, patched_moneta, monkeypatch
+) -> None:
+    """Two deposits under different BRIDGE_EMBEDDER_MODE values land
+    with distinct ``_embedder`` tags in their payloads. This is the
+    storage-side guard against silent mixing of vector spaces."""
+
+    class _StubBGE:
+        """Avoid loading the real model — the test asserts on tags only."""
+        def encode(self, text, **kwargs):
+            return [0.0] * DIMENSION
+
+    monkeypatch.setattr(vector_mod, "_bge_model", _StubBGE())
+
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    ingest.ingest_outcome(_outcome(session="alpha"), tmp_path / "moneta")
+
+    monkeypatch.setenv(ENV_VAR, "bge")
+    ingest.ingest_outcome(_outcome(session="alpha"), tmp_path / "moneta")
+
+    assert len(patched_moneta.instances) == 2
+    payload_synth, _ = patched_moneta.instances[0].deposit_calls[0]
+    payload_bge, _ = patched_moneta.instances[1].deposit_calls[0]
+    parsed_synth = json.loads(payload_synth)
+    parsed_bge = json.loads(payload_bge)
+    assert parsed_synth["_embedder"] == EMBEDDER_VERSION_SYNTHETIC
+    assert parsed_bge["_embedder"] == EMBEDDER_VERSION_BGE
+    assert parsed_synth["_embedder"] != parsed_bge["_embedder"]
 
 
 def test_no_dedup_logic(tmp_path, patched_moneta) -> None:

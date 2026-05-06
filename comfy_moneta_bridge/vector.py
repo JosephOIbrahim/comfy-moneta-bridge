@@ -30,6 +30,8 @@ DIMENSION = 384
 DEFAULT_MODE = "synthetic"
 ENV_VAR = "BRIDGE_EMBEDDER_MODE"
 BGE_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+EMBEDDER_VERSION_SYNTHETIC = "synthetic-v0"
+EMBEDDER_VERSION_BGE = "bge-small-en-v1.5"
 
 # Lazy singleton — populated on first ``encode_outcome`` call. Module-level
 # so a single process amortises the ~100MB model download / load.
@@ -64,6 +66,16 @@ def from_env() -> str:
     """
     mode = os.environ.get(ENV_VAR, DEFAULT_MODE).strip().lower()
     return mode if mode in {"synthetic", "bge"} else DEFAULT_MODE
+
+
+def current_embedder_version() -> str:
+    """Version tag stamped onto every deposit so query-side can reject
+    cross-mode noise. Pinned to the implementation, not the mode string,
+    so a future model swap (e.g. bge-base) gets a distinct tag without
+    breaking the synthetic path's stable identity."""
+    if from_env() == "bge":
+        return EMBEDDER_VERSION_BGE
+    return EMBEDDER_VERSION_SYNTHETIC
 
 
 def _get_bge_model():

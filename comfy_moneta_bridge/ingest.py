@@ -31,6 +31,7 @@ from moneta import Moneta, MonetaConfig
 
 from comfy_moneta_bridge.vector import (
     DIMENSION,
+    current_embedder_version,
     encode_outcome,
     from_env,
     synthesize_vector,
@@ -82,7 +83,11 @@ def ingest_outcome(outcome: dict, moneta_storage_path: Path) -> None:
         embedding = encode_outcome(outcome)
     else:
         embedding = synthesize_vector(session)
-    payload = json.dumps(outcome, sort_keys=True, ensure_ascii=False)
+    # Decorate the storage payload (not the caller's outcome) with the
+    # embedder version. Mode flips between deposits would otherwise mix
+    # incomparable vectors into one VectorIndex with no recovery signal.
+    tagged = {**outcome, "_embedder": current_embedder_version()}
+    payload = json.dumps(tagged, sort_keys=True, ensure_ascii=False)
 
     config = _build_config(moneta_storage_path)
     with Moneta(config) as m:

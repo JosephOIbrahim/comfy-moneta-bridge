@@ -24,6 +24,10 @@ from comfy_moneta_bridge.capsule import (
     CAPSULE_SCHEMA_VERSION,
     write_capsule,
 )
+from comfy_moneta_bridge.vector import (
+    EMBEDDER_VERSION_BGE,
+    EMBEDDER_VERSION_SYNTHETIC,
+)
 
 
 def _outcome(**overrides) -> dict:
@@ -208,6 +212,39 @@ def test_empty_session_writes_empty_notes(tmp_path, patched_moneta) -> None:
     assert capsule_dict["schema_version"] == 2
     assert capsule_dict["notes"] == []
     assert capsule_dict["metadata"]["memory_count"] == 0
+
+
+def test_skips_mixed_embedder_versions(tmp_path, patched_moneta, caplog) -> None:
+    """Capsule writer drops deposits whose ``_embedder`` tag does not
+    match the current mode and logs how many were skipped.
+
+    Default test mode is synthetic, so synthetic-v0 deposits are kept
+    and bge-tagged deposits are dropped. Untagged deposits (pre-Day-2)
+    are treated as synthetic-v0 — kept under default mode.
+    """
+    patched_moneta.canned = [
+        _memory_from({**_outcome(timestamp=1.0),
+                      "_embedder": EMBEDDER_VERSION_SYNTHETIC}),
+        _memory_from({**_outcome(timestamp=2.0),
+                      "_embedder": EMBEDDER_VERSION_BGE}),
+        _memory_from({**_outcome(timestamp=3.0),
+                      "_embedder": EMBEDDER_VERSION_SYNTHETIC}),
+        _memory_from({**_outcome(timestamp=4.0),
+                      "_embedder": EMBEDDER_VERSION_BGE}),
+        # Untagged legacy deposit — implicit synthetic-v0.
+        _memory_from(_outcome(timestamp=5.0)),
+    ]
+    caplog.set_level(logging.INFO, logger="comfy_moneta_bridge.capsule")
+    out = write_capsule("default", tmp_path, tmp_path / "moneta")
+    capsule_dict = json.loads(out.read_text(encoding="utf-8"))
+
+    # 3 synthetic-tagged (incl. legacy untagged) survive; 2 bge dropped.
+    assert capsule_dict["metadata"]["memory_count"] == 3
+    # Skip count surfaces in INFO logs so an operator notices mixed state.
+    assert any(
+        "skipped 2" in r.message and "embedder" in r.message
+        for r in caplog.records
+    ), f"expected 'skipped 2 ... embedder' in logs; got {[r.message for r in caplog.records]}"
 
 
 def test_query_limit_warning(tmp_path, patched_moneta, caplog) -> None:

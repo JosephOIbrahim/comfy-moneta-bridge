@@ -38,6 +38,8 @@ from moneta import Moneta, MonetaConfig
 
 from comfy_moneta_bridge.vector import (
     DIMENSION,
+    EMBEDDER_VERSION_SYNTHETIC,
+    current_embedder_version,
     encode_outcome,
     from_env,
     synthesize_vector,
@@ -136,7 +138,9 @@ def write_capsule(
             session_name,
         )
 
+    expected_version = current_embedder_version()
     parsed: list[dict] = []
+    skipped_wrong_version = 0
     for memory in memories:
         try:
             d = json.loads(memory.payload)
@@ -146,11 +150,27 @@ def write_capsule(
                 type(e).__name__,
             )
             continue
+        # Reject deposits made under a different embedder. Pre-Day-2
+        # deposits have no tag → treat as synthetic-v0 (the only mode
+        # that existed). Mode-mismatch deposits are silently dropped so
+        # the capsule never mixes vector spaces.
+        deposit_version = d.get("_embedder", EMBEDDER_VERSION_SYNTHETIC)
+        if deposit_version != expected_version:
+            skipped_wrong_version += 1
+            continue
         if d.get("session") != session_name:
             # PRNG-collision guard: cosine-near-1 across distinct seeds
             # would still surface another session's memory; filter it out.
             continue
         parsed.append(d)
+
+    if skipped_wrong_version:
+        _logger.info(
+            "write_capsule: skipped %d memories from a different embedder "
+            "version (current=%s)",
+            skipped_wrong_version,
+            expected_version,
+        )
 
     parsed.sort(key=lambda o: o.get("timestamp") or 0.0)
 
