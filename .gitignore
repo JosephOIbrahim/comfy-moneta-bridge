@@ -32,3 +32,6 @@ htmlcov/
 
 # Local Moneta storage produced by integration tests
 .moneta_storage/
+
+# Internal working docs
+README_REWRITE_DIRECTIVE.md
