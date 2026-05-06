@@ -107,3 +107,31 @@ def hydrate(
     if launch:
         proc = launch_mod.launch_with_session(session_name, comfy_cozy_root)
         typer.echo(f"Spawned Comfy-Cozy pid={proc.pid}")
+
+
+@app.command()
+def recall(
+    query: str = typer.Argument(
+        ..., help="Natural-language query text. Real semantic match requires BRIDGE_EMBEDDER_MODE=bge."
+    ),
+    top_k: int = typer.Option(
+        10, "--top-k", "-k", help="Number of matches to return."
+    ),
+    moneta_storage: Path = typer.Option(
+        DEFAULT_MONETA_STORAGE,
+        "--moneta-storage",
+        help="Directory containing Moneta WAL+snapshot files.",
+    ),
+) -> None:
+    """Semantic recall across all stored outcomes (newline-delimited JSON)."""
+    import json
+    from comfy_moneta_bridge import recall as recall_mod
+
+    results = recall_mod.recall(query, moneta_storage, top_k=top_k)
+    for r in results:
+        typer.echo(json.dumps(r, ensure_ascii=False, sort_keys=True))
+    if not results:
+        typer.echo(
+            "(no matches — check BRIDGE_EMBEDDER_MODE matches the deposit mode)",
+            err=True,
+        )
