@@ -32,10 +32,10 @@ import json
 import logging
 from pathlib import Path
 
-from moneta import Moneta, MonetaConfig
+from moneta import Moneta
 
+from comfy_moneta_bridge.moneta_config import build_config
 from comfy_moneta_bridge.vector import (
-    DIMENSION,
     EMBEDDER_VERSION_SYNTHETIC,
     current_embedder_version,
     encode_outcome,
@@ -44,18 +44,6 @@ from comfy_moneta_bridge.vector import (
 )
 
 _logger = logging.getLogger(__name__)
-
-
-def _build_config(moneta_storage_path: Path) -> MonetaConfig:
-    storage = Path(moneta_storage_path)
-    storage.mkdir(parents=True, exist_ok=True)
-    return MonetaConfig(
-        storage_uri=f"moneta-bridge://{storage.as_posix()}",
-        snapshot_path=storage / "snapshot.json",
-        wal_path=storage / "wal.jsonl",
-        mock_target_log_path=storage / "usd_authorings.jsonl",
-        embedding_dim=DIMENSION,
-    )
 
 
 def recall(
@@ -79,7 +67,7 @@ def recall(
 
     fetch_limit = max(top_k * 4, top_k + 32)
 
-    config = _build_config(moneta_storage_path)
+    config = build_config(moneta_storage_path)
     with Moneta(config) as m:
         memories = m.query(embedding=embedding, limit=fetch_limit)
 

@@ -27,10 +27,10 @@ import json
 import logging
 from pathlib import Path
 
-from moneta import Moneta, MonetaConfig
+from moneta import Moneta
 
+from comfy_moneta_bridge.moneta_config import build_config
 from comfy_moneta_bridge.vector import (
-    DIMENSION,
     current_embedder_version,
     encode_outcome,
     from_env,
@@ -40,25 +40,6 @@ from comfy_moneta_bridge.vector import (
 _logger = logging.getLogger(__name__)
 
 EXPECTED_SCHEMA_VERSION = 1
-
-
-def _build_config(moneta_storage_path: Path) -> MonetaConfig:
-    """Construct the Moneta handle config for the bridge's storage URI.
-
-    All bridge-side ingests share one storage URI (one ECS / vector
-    index / WAL+snapshot pair). ``embedding_dim`` pinned to ``DIMENSION``
-    so a fresh handle's vector index is locked to 384 from the first
-    deposit and any dim-mismatch is caught loudly.
-    """
-    storage = Path(moneta_storage_path)
-    storage.mkdir(parents=True, exist_ok=True)
-    return MonetaConfig(
-        storage_uri=f"moneta-bridge://{storage.as_posix()}",
-        snapshot_path=storage / "snapshot.json",
-        wal_path=storage / "wal.jsonl",
-        mock_target_log_path=storage / "usd_authorings.jsonl",
-        embedding_dim=DIMENSION,
-    )
 
 
 def ingest_outcome(outcome: dict, moneta_storage_path: Path) -> None:
@@ -89,7 +70,7 @@ def ingest_outcome(outcome: dict, moneta_storage_path: Path) -> None:
     tagged = {**outcome, "_embedder": current_embedder_version()}
     payload = json.dumps(tagged, sort_keys=True, ensure_ascii=False)
 
-    config = _build_config(moneta_storage_path)
+    config = build_config(moneta_storage_path)
     with Moneta(config) as m:
         m.deposit(payload=payload, embedding=embedding)
         # Hard Rule §12: persistence requires run_sleep_pass(). Without

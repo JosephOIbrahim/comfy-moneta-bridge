@@ -245,14 +245,16 @@ def test_deposit_persists_after_handle_close(tmp_path) -> None:
     ``run_sleep_pass()`` inside the with-block, the deposit lives only
     in the in-memory ECS and the second handle would see ``ecs.n == 0``.
     """
-    from moneta import Moneta, MonetaConfig
+    from moneta import Moneta
+
+    from comfy_moneta_bridge.moneta_config import build_config
 
     storage = tmp_path / "moneta"
     ingest.ingest_outcome(_outcome(session="durable_session"), storage)
 
     # Second handle, same storage. If run_sleep_pass() didn't run, this
     # would hydrate an empty ECS.
-    config2 = ingest._build_config(storage)
+    config2 = build_config(storage)
     with Moneta(config2) as m:
         assert m.ecs.n >= 1
         # Query with the same synthetic vector to confirm we can find it.
