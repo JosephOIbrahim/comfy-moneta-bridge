@@ -60,6 +60,39 @@ def _empty_workflow_block() -> dict:
     }
 
 
+WORKFLOW_SNAPSHOT_KIND = "workflow_snapshot"
+
+
+def _workflow_block_from_snapshot(snapshot_payload: dict) -> dict:
+    """Build a populated workflow block from a `_kind=workflow_snapshot`
+    deposit payload.
+
+    Per BRIDGE_BUILD_MISSION_v3_2.md scope addition K. The orchestrator
+    emits one snapshot deposit at end-of-run; ``write_capsule`` picks
+    up the latest one per session and threads it into the capsule's
+    workflow block so Comfy-Cozy can load with the actual workflow on
+    the next ``AUTO_LOAD_SESSION`` spawn.
+
+    The deposit payload schema:
+      {
+        "schema_version": 1,           # routed through ingest_outcome
+        "session": <session_name>,
+        "timestamp": <float>,
+        "_kind": "workflow_snapshot",
+        "_embedder": <tag>,
+        "workflow": {<api-format dict>},
+        "loaded_path": <str | None>,   # optional source path hint
+      }
+    """
+    return {
+        "loaded_path": snapshot_payload.get("loaded_path"),
+        "format": "api",
+        "base_workflow": snapshot_payload.get("workflow"),
+        "current_workflow": snapshot_payload.get("workflow"),
+        "history_depth": 1,
+    }
+
+
 def _outcome_to_notes(outcome: dict, saved_at: str) -> list[dict]:
     """Translate one outcome dict to zero or more schema_v2 note entries."""
     notes: list[dict] = []
@@ -162,20 +195,34 @@ def write_capsule(
 
     parsed.sort(key=lambda o: o.get("timestamp") or 0.0)
 
+    # Snapshot extraction is internal-only: agent-deposited workflow
+    # snapshots ride the same ingest path as normal outcomes (same
+    # schema_version=1, same _embedder tag) but are discriminated by
+    # `_kind=workflow_snapshot`. We split them out of `parsed` so they
+    # don't pollute the notes feed, then pick the latest by timestamp.
+    snapshots = [o for o in parsed if o.get("_kind") == WORKFLOW_SNAPSHOT_KIND]
+    outcomes = [o for o in parsed if o.get("_kind") != WORKFLOW_SNAPSHOT_KIND]
+
+    workflow_block = (
+        _workflow_block_from_snapshot(snapshots[-1])
+        if snapshots
+        else _empty_workflow_block()
+    )
+
     saved_at = time.strftime("%Y-%m-%dT%H:%M:%S")
     notes: list[dict] = []
-    for outcome in parsed:
+    for outcome in outcomes:
         notes.extend(_outcome_to_notes(outcome, saved_at))
 
     capsule = {
         "name": session_name,
         "saved_at": saved_at,
         "schema_version": CAPSULE_SCHEMA_VERSION,
-        "workflow": _empty_workflow_block(),
+        "workflow": workflow_block,
         "notes": notes,
         "metadata": {
             "hydrated_from": "moneta",
-            "memory_count": len(parsed),
+            "memory_count": len(outcomes),
         },
     }
 
