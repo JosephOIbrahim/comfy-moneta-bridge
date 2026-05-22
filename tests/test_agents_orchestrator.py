@@ -14,7 +14,14 @@ from typing import Iterator
 
 import pytest
 
-from comfy_moneta_bridge.agents.orchestrator import (
+# Importing the orchestrator transitively imports agents.client, which
+# imports httpx and websockets at module load. Under a lean install
+# (no [agents] extras) collection would error rather than skip. These
+# importorskips make the lean-install pytest pass cleanly.
+pytest.importorskip("httpx")
+pytest.importorskip("anthropic")
+
+from comfy_moneta_bridge.agents.orchestrator import (  # noqa: E402
     Orchestrator,
     RoleTurnOutput,
     ToolCall,
