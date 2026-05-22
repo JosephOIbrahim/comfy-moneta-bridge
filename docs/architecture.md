@@ -12,7 +12,8 @@ review and amended by the Phase 0.5b durability finding. The full chain:
 | --- | --- |
 | `BRIDGE_BUILD_MISSION.md` (v1) | First spec — assumed Moneta exposed `ingest_event(dict)` and `read_session_state(name)`. Phase 0.5a scout proved otherwise. |
 | `BRIDGE_BUILD_MISSION_v3.md` | Pivoted to deterministic synthetic vectors against Moneta's four-op handle. Phase 0.5b probe found that bare `deposit()` is not durable across handle close. |
-| `BRIDGE_BUILD_MISSION_v3_1.md` (current) | Adds Hard Rule §12 (`run_sleep_pass()` mandatory) and books the resulting performance ceiling as a v1 task. |
+| `BRIDGE_BUILD_MISSION_v3_1.md` | Adds Hard Rule §12 (`run_sleep_pass()` mandatory) and books the resulting performance ceiling as a v1 task. |
+| `BRIDGE_BUILD_MISSION_v3_2.md` (current) | Unlocks the agent workflow surface explicitly listed as out-of-scope in v3.1. Adds Hard Rules §13–16 (tail/orchestrate mutex, validate-before-submit, localhost-default, planner-checkpoint-before-executor). Clarifies §7 to permit LLM SDKs in the optional `agents/` subpackage only. |
 
 The v3 -> v3.1 amendment is empirically grounded. See
 `scripts/probe_durability.py`:
@@ -46,6 +47,10 @@ attributes.
 | 10 | Atomic commits with clear provenance | One concept per commit |
 | 11 | STOP at gates | Per Commandment §8 — gates only at irreversible transitions in the autonomous build harness |
 | 12 | Persistence requires `run_sleep_pass()` | Empirically verified; without it every deposit is lost (see above) |
+| 13 | `bridge tail` and `bridge orchestrate`/`bridge mcp` are mutually exclusive | PID-file mutex serializes them; they share Moneta URI lock |
+| 14 | `workflow_submit` validates against `/object_info` first | Local catch of bad node types / missing required inputs |
+| 15 | ComfyUI defaults to localhost; remote requires `BRIDGE_ALLOW_REMOTE_COMFY=1` | Prevents accidental execution against production ComfyUI |
+| 16 | EXECUTOR refuses without a fresh PLANNER/MUTATOR checkpoint | Crash-resume must be distinguishable from fresh-start corruption |
 
 ## Why deposit alone doesn't persist
 
@@ -188,10 +193,59 @@ locally rather than as a Comfy-Cozy startup error.
 
 ### `cli.py` — typer
 
-Two commands: `bridge tail` (run forever), `bridge hydrate <name>`
-(one-shot). The hydrate command always prints the hot-hydrate warning
-("must be (re)started ... running instances will not auto-load").
-`--launch` spawns Comfy-Cozy in addition.
+Five commands: `bridge tail` (run forever), `bridge hydrate <name>`
+(one-shot), `bridge recall <query>` (one-shot), `bridge orchestrate
+<goal>` (v0.2, opt-in), `bridge mcp` (v0.2, opt-in). The hydrate
+command always prints the hot-hydrate warning ("must be (re)started
+... running instances will not auto-load"). `--launch` spawns
+Comfy-Cozy in addition. The tail command writes
+`{state_dir}/tail.pid` via `PidFileGuard` and refuses to start if
+`{state_dir}/orchestrate.pid` is present — the §13 mutex.
+
+### `agents/` — v0.2 workflow manipulation surface
+
+Opt-in subpackage gated by the `[agents]` extra. See
+`BRIDGE_BUILD_MISSION_v3_2.md` for the formal scope amendment and
+`AGENTS.md` for the runtime constitution. The subpackage adds:
+
+- `client.py` — async ComfyUI HTTP+WS client. Defaults to
+  `http://127.0.0.1:8188`; non-localhost refused without explicit
+  opt-in (§15). `/object_info` is cached per-client with explicit
+  `refresh_schema()` invalidation.
+- `workflow.py` — typed `Workflow` dataclass wrapping ComfyUI's
+  API-format JSON. Round-trip preserves node ordering, `_meta`,
+  and top-level extras like `_comment`. Mutation primitives:
+  `add_node`, `set_input`, `connect`, `remove_node`. `validate()`
+  catches unknown class_types, missing required inputs, and
+  dangling connection sources.
+- `tools.py` — single source of truth for the tool surface. One
+  `ToolSpec` list yields both Anthropic schemas (`as_anthropic_tools`)
+  and MCP `Tool` registrations (`register_with_mcp`). Both surfaces
+  dispatch through `dispatch(name, args, ctx)` so refusal hooks live
+  in one place.
+- `constitution.py` — loads `AGENTS.md` per orchestration (no
+  module-level cache so operators can edit live).
+- `roles.py` — five-role split with deterministic turn-taking.
+- `harness.py` — `CheckpointStore` (atomic temp+fsync+os.replace,
+  same pattern as `state.CursorStore`), `PidFileGuard` context
+  manager, and §13/§16 enforcement.
+- `orchestrator.py` — drives one goal through the role machine.
+  Owns the Moneta handle implicitly (safe because §13 excludes
+  Tailer concurrency). Final outcomes flow through `ingest_outcome`
+  so the existing durability discipline is preserved.
+- `mcp_server.py` — stdio MCP server wrapping `ALL_TOOLS`.
+  `BRIDGE_MCP_ROLE` env locks the session into one role's allowlist.
+- `loop.py` — `ClaudeRoleDriver` implements the `RoleDriver`
+  protocol against the Anthropic Messages API with prompt-caching
+  on the (long, stable) constitution+role-charter system prompt.
+
+Workflows carried forward through `bridge hydrate`: agents emit a
+`_kind=workflow_snapshot` deposit through the normal ingest path;
+`write_capsule` scans queried memories for the latest snapshot per
+session and populates the capsule's workflow block from it. When no
+snapshot exists, the block remains byte-equal to the pre-v0.2
+`_empty_workflow_block()` (regression-canaried by
+`tests/test_capsule.py::test_schema_v2_workflow_stub`).
 
 ## Considered and rejected
 

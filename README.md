@@ -183,6 +183,61 @@ The capsule loads on Comfy-Cozy startup if `AUTO_LOAD_SESSION=<name>`
 is set. `bridge hydrate --launch` spawns Comfy-Cozy with that env.
 
 
+## Agent orchestration (v0.2, opt-in)
+
+`v0.2` adds an opt-in subpackage that gives agents the ability to
+manipulate ComfyUI workflows through the bridge. The v0 pipeline
+(tail / hydrate / recall) is unchanged; agents live in a new
+`comfy_moneta_bridge/agents/` subpackage behind the `[agents]` extras.
+
+```sh
+pip install "comfy-moneta-bridge[agents]"
+```
+
+Two new entry points:
+
+- `bridge orchestrate <goal>` — runs an internal Claude loop with five
+  roles (PLANNER → MUTATOR → EXECUTOR → CRITIC → MEMORIST) against a
+  local ComfyUI. Default model: `claude-opus-4-7`. Use `--interactive`
+  to require a human ack between PLANNER and EXECUTOR (Hard Rule §16).
+- `bridge mcp` — runs a stdio MCP server exposing the same tool surface
+  to any external agent (Claude Code, Claude Desktop, custom).
+
+Both share one tool layer defined once in `agents/tools.py` and routed
+through `dispatch()`. Tools cover workflow load/mutate/connect/remove/
+validate/submit/interrupt, plus `recall_memory`, `deposit_outcome` (with
+`_kind` discriminator for outcomes vs workflow snapshots vs blockers),
+and `capsule_write`.
+
+The constitution layer is two-tier:
+- `AGENT_COMMANDMENTS.md` — build-time governance for any LLM building
+  the bridge (unchanged from v0).
+- `AGENTS.md` — runtime constitution for agents invoking the tool
+  surface. Re-read per orchestration so operator edits take effect on
+  the next invocation. Defines role tool-allowlists, refusal cases,
+  idempotency contract, Moneta durability discipline, model identity,
+  and failure escalation.
+
+Scope is formally amended by `BRIDGE_BUILD_MISSION_v3_2.md`, which
+adds four new Hard Rules:
+
+| # | Rule |
+|---|---|
+| §13 | `bridge tail` and `bridge orchestrate`/`bridge mcp` are mutually exclusive (PID-file mutex). They share the Moneta URI lock. |
+| §14 | `workflow_submit` runs `workflow_validate` against `/object_info` first. Validation errors block submission. |
+| §15 | ComfyUI defaults to `http://127.0.0.1:8188`. Non-localhost requires `BRIDGE_ALLOW_REMOTE_COMFY=1`. |
+| §16 | EXECUTOR refuses without a fresh PLANNER/MUTATOR checkpoint. `--interactive` adds a human-ack step at the same point. |
+
+Workflows flow back through the existing `bridge hydrate` path:
+agents emit a `_kind=workflow_snapshot` deposit through `ingest_outcome`,
+and `write_capsule` extracts the latest one per session to populate the
+capsule's workflow block (replacing the v0 null stub when a snapshot
+exists). The signature of `write_capsule` is unchanged.
+
+See `BRIDGE_BUILD_MISSION_v3_2.md` for the full scope amendment and
+`AGENTS.md` for the runtime constitution.
+
+
 ## v0 limitations
 
 These are documented failure modes; each has a concrete v1 remediation.
@@ -228,17 +283,30 @@ batched-deposit layer*.
 
 ```
 comfy_moneta_bridge/
-  vector.py        deterministic synthetic embedder
-  state.py         CursorStore with atomic write + fsync
-  tail.py          rotation-aware JSONL tailer
-  ingest.py        deposit + run_sleep_pass pipeline
-  capsule.py       Moneta query -> schema_v2 capsule writer
-  launch.py        Comfy-Cozy spawn with AUTO_LOAD_SESSION
-  cli.py           typer CLI: bridge tail / bridge hydrate
-tests/             49 tests (mocked + real-Moneta integration)
-scripts/           Phase 0.5b probes (dimensionality, durability, benchmark)
+  vector.py            deterministic synthetic embedder + opt-in BGE
+  state.py             CursorStore with atomic write + fsync
+  tail.py              rotation-aware JSONL tailer
+  ingest.py            deposit + run_sleep_pass pipeline
+  capsule.py           Moneta query -> schema_v2 capsule writer
+  recall.py            cross-session semantic recall
+  launch.py            Comfy-Cozy spawn with AUTO_LOAD_SESSION
+  moneta_config.py     shared MonetaConfig builder
+  cli.py               typer CLI: bridge tail / hydrate / recall /
+                         orchestrate / mcp
+  agents/              v0.2 agent layer (opt-in via [agents] extras)
+    client.py          ComfyUI HTTP+WS client (localhost-only by default)
+    workflow.py        typed graph model + mutation primitives
+    tools.py           single source of truth for Anthropic+MCP tools
+    constitution.py    AGENTS.md loader + role allowlist registry
+    roles.py           PLANNER/MUTATOR/EXECUTOR/CRITIC/MEMORIST
+    harness.py         CheckpointStore + PID-file mutex (§13, §16)
+    orchestrator.py    single-goal driver
+    mcp_server.py      stdio MCP server
+    loop.py            internal Anthropic-SDK Claude loop
+tests/                 250 tests (mocked + real-Moneta integration)
+scripts/               Phase 0.5b probes (dimensionality, durability, benchmark)
 docs/architecture.md   longer-form architecture notes
-demo/              workflow.json + shot_list.md for the demo arc
+demo/                  workflow.json + shot_list.md for the demo arc
 ```
 
 
