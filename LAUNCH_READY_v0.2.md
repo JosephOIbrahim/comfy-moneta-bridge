@@ -1,7 +1,7 @@
 # LAUNCH READY — comfy-moneta-bridge v0.2.0
 
-**Pushed:** TBD (filled in post-merge of PR #1)
-**Tag:** `v0.2.0` (annotated; created post-merge against `master`)
+**Pushed:** 2026-05-24 (PR #1 merged to `master` as merge commit `341173b`)
+**Tag:** `v0.2.0` (annotated; created against `master` at the doc-pin commit)
 **Repo URL:** https://github.com/JosephOIbrahim/comfy-moneta-bridge
 **Default branch:** `master`
 **Visibility:** public
@@ -165,16 +165,18 @@ Full v0.1 list still applies (see `LAUNCH_READY.md` and `README.md` §"v0 limita
 
 ```sh
 git ls-remote https://github.com/JosephOIbrahim/comfy-moneta-bridge.git
-# TBD post-merge:
-#   <merge-sha>   HEAD
-#   <merge-sha>   refs/heads/master
+#   <head-sha>                                 HEAD
+#   <head-sha>                                 refs/heads/master
 #   26508b875a6c24c9aaa77e428c39e3aa6efae4b6   refs/tags/v0.1.0
 #   922bc55326d5f7dcc2fd8bda89566eb01fc2ef33   refs/tags/v0.1.0^{}
-#   <tag-object-sha>   refs/tags/v0.2.0
-#   <merge-sha>   refs/tags/v0.2.0^{}
+#   <tag-object-sha>                           refs/tags/v0.2.0
+#   <head-sha>                                 refs/tags/v0.2.0^{}
 ```
 
-`master` and `v0.2.0^{}` will both point at the PR #1 merge commit. The tag object SHA is filled in here once `git tag -a v0.2.0` runs against `master`.
+PR #1 merged to `master` as merge commit `341173b`. This doc-pin commit
+sits one above it and is what `v0.2.0` is tagged at, so `master` HEAD ==
+`v0.2.0^{}`. The v0.2.0 content is everything up to and including the
+merge commit. `v0.1.0` (commit `922bc55`) is preserved untouched.
 
 ---
 
