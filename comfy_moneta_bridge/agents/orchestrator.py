@@ -247,6 +247,28 @@ class Orchestrator:
 
             executed_calls: list[dict] = []
             for tc in output.tool_calls:
+                # Idempotent submit (AGENTS.md §3 / C2): if a submission
+                # is already in flight for this goal — i.e. a prior run
+                # recorded a prompt_id mid-turn before crashing — do NOT
+                # re-submit. Reuse the recorded prompt_id so resume picks
+                # up at the await instead of double-posting to ComfyUI.
+                if (
+                    tc.name == "workflow_submit"
+                    and harness.has_inflight_submission(gid)
+                ):
+                    existing = harness.resume_goal(gid)
+                    prompt_id = existing.prompt_id if existing else prompt_id
+                    transcript.append(
+                        {
+                            "role": role, "tool": tc.name,
+                            "result": {"prompt_id": prompt_id, "resumed": True},
+                        }
+                    )
+                    executed_calls.append(
+                        {"id": tc.id, "name": tc.name,
+                         "result": {"prompt_id": prompt_id, "resumed": True}}
+                    )
+                    continue
                 try:
                     res = await dispatch(tc.name, tc.args, ctx)
                 except RefusalError as e:
@@ -262,6 +284,10 @@ class Orchestrator:
                 )
                 if tc.name == "workflow_submit" and isinstance(res, dict):
                     prompt_id = res.get("prompt_id") or prompt_id
+                    # Checkpoint the prompt_id immediately, before any
+                    # await begins, so a crash mid-render is resumable.
+                    if prompt_id:
+                        harness.record_inflight_submission(gid, prompt_id)
 
             if role == "CRITIC":
                 verdict = output.verdict

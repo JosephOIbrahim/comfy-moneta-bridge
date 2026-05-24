@@ -248,3 +248,155 @@ async def test_orchestrator_max_turns_halts(tmp_path) -> None:
     )
     result = await orch.run("x", session="halt_test")
     assert result.completed is False
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_executor_awaits_result(tmp_path) -> None:
+    """EXECUTOR submits then awaits; the await result lands in the
+    transcript and the checkpoint records the prompt_id."""
+    moneta = tmp_path / "moneta"
+    state_dir = tmp_path / "state"
+
+    class _FakeComfy:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get_object_info(self):
+            return {"KSampler": {"input": {"required": {}}}}
+
+        async def post_prompt(self, wf):
+            return "pid-await"
+
+        async def await_result(self, prompt_id, timeout_s=300.0):
+            return {"status": "success", "prompt_id": prompt_id,
+                    "history": {prompt_id: {"status": {"status_str": "success"}}}}
+
+    async def _client_factory():
+        return _FakeComfy()
+
+    scripted = [
+        ("PLANNER", RoleTurnOutput(
+            text="plan",
+            tool_calls=[ToolCall(id="c1", name="workflow_load",
+                                 args={"workflow": {"1": {"class_type": "KSampler"}}})],
+        )),
+        ("MUTATOR", RoleTurnOutput(text="no edit needed")),
+        ("EXECUTOR", RoleTurnOutput(
+            text="submit + await",
+            tool_calls=[
+                ToolCall(id="c2", name="workflow_submit", args={}),
+                ToolCall(id="c3", name="workflow_await_result",
+                         args={"prompt_id": "pid-await"}),
+            ],
+        )),
+        ("CRITIC", RoleTurnOutput(text="render ok", verdict="ACCEPT")),
+        ("MEMORIST", RoleTurnOutput(
+            text="record",
+            tool_calls=[ToolCall(id="c4", name="deposit_outcome",
+                                 args={"workflow_summary": "awaited"})],
+        )),
+    ]
+
+    orch = Orchestrator(
+        driver=StubDriver(scripted),
+        moneta_storage_path=moneta,
+        state_dir=state_dir,
+        client_factory=_client_factory,
+    )
+    result = await orch.run("await test", session="awaitsess")
+    assert result.completed is True
+    assert result.prompt_id == "pid-await"
+    # The await result reached the transcript for CRITIC to read.
+    await_entries = [
+        e for e in result.transcript
+        if e.get("tool") == "workflow_await_result"
+    ]
+    assert await_entries
+    assert await_entries[0]["result"]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_resume_skips_resubmit(tmp_path) -> None:
+    """Crash-resume: a checkpoint with an in-flight prompt_id must not
+    trigger a second post_prompt when EXECUTOR re-runs."""
+    from comfy_moneta_bridge.agents.harness import (
+        CheckpointStore,
+        OrchestrationCheckpoint,
+    )
+
+    moneta = tmp_path / "moneta"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+
+    # Simulate a crash after submit: the EXECUTOR turn dispatched
+    # workflow_submit and record_inflight_submission stamped the
+    # prompt_id onto the still-current MUTATOR checkpoint, then the
+    # process died before the end-of-turn advance.
+    store = CheckpointStore(state_dir / "checkpoints.json")
+    store.set("g-resume", OrchestrationCheckpoint(
+        goal_id="g-resume", goal="bump seed", session="resume",
+        role="MUTATOR", turn=1, prompt_id="inflight-p1", timestamp=1.0,
+    ))
+
+    posted: list = []
+
+    class _FakeComfy:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get_object_info(self):
+            return {"KSampler": {"input": {"required": {}}}}
+
+        async def post_prompt(self, wf):  # must NOT be called on resume
+            posted.append(wf)
+            return "SHOULD-NOT-HAPPEN"
+
+        async def await_result(self, prompt_id, timeout_s=300.0):
+            return {"status": "success", "prompt_id": prompt_id, "history": {}}
+
+    async def _client_factory():
+        return _FakeComfy()
+
+    scripted = [
+        # Resume starts at MUTATOR (per the seeded checkpoint).
+        ("MUTATOR", RoleTurnOutput(
+            text="re-mutate",
+            tool_calls=[ToolCall(id="r1", name="workflow_load",
+                                 args={"workflow": {"1": {"class_type": "KSampler"}}})],
+        )),
+        ("EXECUTOR", RoleTurnOutput(
+            text="re-submit (should be short-circuited) + await",
+            tool_calls=[
+                ToolCall(id="r2", name="workflow_submit", args={}),
+                ToolCall(id="r3", name="workflow_await_result",
+                         args={"prompt_id": "inflight-p1"}),
+            ],
+        )),
+        ("CRITIC", RoleTurnOutput(text="ok", verdict="ACCEPT")),
+        ("MEMORIST", RoleTurnOutput(
+            text="record",
+            tool_calls=[ToolCall(id="r4", name="deposit_outcome",
+                                 args={"workflow_summary": "resumed"})],
+        )),
+    ]
+
+    orch = Orchestrator(
+        driver=StubDriver(scripted),
+        moneta_storage_path=moneta,
+        state_dir=state_dir,
+        client_factory=_client_factory,
+    )
+    result = await orch.run("bump seed", session="resume", goal_id="g-resume")
+    assert result.completed is True
+    # The core guarantee: no second submission to ComfyUI.
+    assert posted == []
+    # The reused prompt_id flowed through.
+    resumed = [e for e in result.transcript
+               if e.get("tool") == "workflow_submit"]
+    assert resumed and resumed[0]["result"].get("resumed") is True

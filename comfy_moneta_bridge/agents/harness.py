@@ -275,6 +275,45 @@ class AgentHarness:
         self.checkpoint_store.set(goal_id, cp)
         return cp
 
+    def record_inflight_submission(
+        self, goal_id: str, prompt_id: str
+    ) -> OrchestrationCheckpoint:
+        """Persist a ComfyUI ``prompt_id`` immediately, mid-turn.
+
+        Per AGENTS.md §3: the prompt_id is checkpointed BEFORE the
+        await begins, so a crash between submit and await leaves a
+        durable record. The role/turn are unchanged — this only stamps
+        the in-flight prompt_id onto the current checkpoint.
+        """
+        prior = self.checkpoint_store.get(goal_id)
+        if prior is None:
+            raise RuntimeError(
+                f"cannot record submission for unknown goal_id {goal_id!r}"
+            )
+        cp = OrchestrationCheckpoint(
+            goal_id=prior.goal_id,
+            goal=prior.goal,
+            session=prior.session,
+            role=prior.role,
+            turn=prior.turn,
+            last_tool_calls=prior.last_tool_calls,
+            prompt_id=prompt_id,
+            workflow_state=prior.workflow_state,
+            critic_verdict=prior.critic_verdict,
+            timestamp=time.time(),
+        )
+        self.checkpoint_store.set(goal_id, cp)
+        return cp
+
+    def has_inflight_submission(self, goal_id: str) -> bool:
+        """True if the latest checkpoint records a prompt_id but the
+        run has not yet reached CRITIC/MEMORIST (i.e. a submission is
+        in flight and its result was not yet evaluated)."""
+        cp = self.checkpoint_store.get(goal_id)
+        if cp is None:
+            return False
+        return bool(cp.prompt_id) and cp.role in ("EXECUTOR", "MUTATOR")
+
     def is_tool_already_done(
         self, goal_id: str, tool_call_id: str
     ) -> bool:
