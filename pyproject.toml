@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "comfy-moneta-bridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "Wire Comfy-Cozy experience output into Moneta cognitive substrate"
 requires-python = ">=3.11"
 dependencies = [
@@ -17,8 +17,20 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-httpx>=0.30",
+    "jsonschema>=4.21",
 ]
 embeddings = ["sentence-transformers>=2.2.0"]
+# Agent-driven workflow manipulation surface (v0.2, opt-in).
+# Hard Rule §7 amendment in BRIDGE_BUILD_MISSION_v3_2.md: LLM SDKs are
+# permitted exclusively in the agents/ subpackage, gated by this extra.
+# Default `pip install comfy-moneta-bridge` keeps the lean core.
+agents = [
+    "anthropic>=0.40.0",
+    "mcp>=1.0.0",
+    "httpx>=0.27.0",
+    "websockets>=12.0",
+]
 
 [project.scripts]
 bridge = "comfy_moneta_bridge.cli:app"

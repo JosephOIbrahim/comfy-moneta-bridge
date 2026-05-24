@@ -34,10 +34,10 @@ import os
 import time
 from pathlib import Path
 
-from moneta import Moneta, MonetaConfig
+from moneta import Moneta
 
+from comfy_moneta_bridge.moneta_config import build_config
 from comfy_moneta_bridge.vector import (
-    DIMENSION,
     EMBEDDER_VERSION_SYNTHETIC,
     current_embedder_version,
     encode_outcome,
@@ -50,18 +50,6 @@ _logger = logging.getLogger(__name__)
 CAPSULE_SCHEMA_VERSION = 2
 
 
-def _build_config(moneta_storage_path: Path) -> MonetaConfig:
-    storage = Path(moneta_storage_path)
-    storage.mkdir(parents=True, exist_ok=True)
-    return MonetaConfig(
-        storage_uri=f"moneta-bridge://{storage.as_posix()}",
-        snapshot_path=storage / "snapshot.json",
-        wal_path=storage / "wal.jsonl",
-        mock_target_log_path=storage / "usd_authorings.jsonl",
-        embedding_dim=DIMENSION,
-    )
-
-
 def _empty_workflow_block() -> dict:
     return {
         "loaded_path": None,
@@ -69,6 +57,39 @@ def _empty_workflow_block() -> dict:
         "base_workflow": None,
         "current_workflow": None,
         "history_depth": 0,
+    }
+
+
+WORKFLOW_SNAPSHOT_KIND = "workflow_snapshot"
+
+
+def _workflow_block_from_snapshot(snapshot_payload: dict) -> dict:
+    """Build a populated workflow block from a `_kind=workflow_snapshot`
+    deposit payload.
+
+    Per BRIDGE_BUILD_MISSION_v3_2.md scope addition K. The orchestrator
+    emits one snapshot deposit at end-of-run; ``write_capsule`` picks
+    up the latest one per session and threads it into the capsule's
+    workflow block so Comfy-Cozy can load with the actual workflow on
+    the next ``AUTO_LOAD_SESSION`` spawn.
+
+    The deposit payload schema:
+      {
+        "schema_version": 1,           # routed through ingest_outcome
+        "session": <session_name>,
+        "timestamp": <float>,
+        "_kind": "workflow_snapshot",
+        "_embedder": <tag>,
+        "workflow": {<api-format dict>},
+        "loaded_path": <str | None>,   # optional source path hint
+      }
+    """
+    return {
+        "loaded_path": snapshot_payload.get("loaded_path"),
+        "format": "api",
+        "base_workflow": snapshot_payload.get("workflow"),
+        "current_workflow": snapshot_payload.get("workflow"),
+        "history_depth": 1,
     }
 
 
@@ -125,7 +146,7 @@ def write_capsule(
         embedding = encode_outcome({"session": session_name})
     else:
         embedding = synthesize_vector(session_name)
-    config = _build_config(moneta_storage_path)
+    config = build_config(moneta_storage_path)
 
     with Moneta(config) as m:
         memories = m.query(embedding=embedding, limit=query_limit)
@@ -174,20 +195,34 @@ def write_capsule(
 
     parsed.sort(key=lambda o: o.get("timestamp") or 0.0)
 
+    # Snapshot extraction is internal-only: agent-deposited workflow
+    # snapshots ride the same ingest path as normal outcomes (same
+    # schema_version=1, same _embedder tag) but are discriminated by
+    # `_kind=workflow_snapshot`. We split them out of `parsed` so they
+    # don't pollute the notes feed, then pick the latest by timestamp.
+    snapshots = [o for o in parsed if o.get("_kind") == WORKFLOW_SNAPSHOT_KIND]
+    outcomes = [o for o in parsed if o.get("_kind") != WORKFLOW_SNAPSHOT_KIND]
+
+    workflow_block = (
+        _workflow_block_from_snapshot(snapshots[-1])
+        if snapshots
+        else _empty_workflow_block()
+    )
+
     saved_at = time.strftime("%Y-%m-%dT%H:%M:%S")
     notes: list[dict] = []
-    for outcome in parsed:
+    for outcome in outcomes:
         notes.extend(_outcome_to_notes(outcome, saved_at))
 
     capsule = {
         "name": session_name,
         "saved_at": saved_at,
         "schema_version": CAPSULE_SCHEMA_VERSION,
-        "workflow": _empty_workflow_block(),
+        "workflow": workflow_block,
         "notes": notes,
         "metadata": {
             "hydrated_from": "moneta",
-            "memory_count": len(parsed),
+            "memory_count": len(outcomes),
         },
     }
 

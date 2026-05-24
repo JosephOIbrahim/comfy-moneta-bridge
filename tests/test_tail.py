@@ -55,12 +55,13 @@ def _write_lines(path: Path, lines: list[dict], append: bool = False) -> None:
 def collected(monkeypatch):
     bucket: list[dict] = []
 
-    def fake_ingest(outcome, moneta_storage_path):
-        bucket.append(outcome)
+    def fake_ingest_batch(outcomes, moneta_storage_path):
+        bucket.extend(outcomes)
+        return len(outcomes)
 
     monkeypatch.setattr(
-        "comfy_moneta_bridge.ingest.ingest_outcome",
-        fake_ingest,
+        "comfy_moneta_bridge.ingest.ingest_batch",
+        fake_ingest_batch,
         raising=False,
     )
     return bucket
@@ -241,3 +242,111 @@ def test_malformed_line_skipped(tmp_path, collected) -> None:
     # Cursor advanced past the malformed line so it isn't replayed.
     state = tailer._cursor_store.get(str(path))
     assert state.offset == path.stat().st_size
+
+
+# ─── Opt-in cross-event buffering (L1) ────────────────────────────────
+
+
+def _buffered_tailer(tmp_path: Path, batch_size=1, batch_max_delay_s=0.0):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    cursor = CursorStore(tmp_path / "cursor.json")
+    return Tailer(
+        sessions, cursor, tmp_path / "moneta_storage",
+        batch_size=batch_size, batch_max_delay_s=batch_max_delay_s,
+    )
+
+
+def test_batching_disabled_by_default(tmp_path) -> None:
+    tailer = _buffered_tailer(tmp_path)
+    assert tailer._batching_enabled is False
+
+
+def test_buffered_count_trigger_holds_then_flushes(tmp_path, collected) -> None:
+    tailer = _buffered_tailer(tmp_path, batch_size=3)
+    path = tmp_path / "sessions" / "default_outcomes.jsonl"
+
+    # Two lines in one event: buffered, NOT flushed (2 < 3), and the
+    # persisted cursor must NOT advance yet.
+    _write_lines(path, [_outcome(timestamp=1.0), _outcome(timestamp=2.0)])
+    tailer._handle_change(Change.modified, path)
+    assert collected == []
+    assert tailer._cursor_store.get(str(path)) is None
+
+    # A third line crosses the threshold → flush deposits all three and
+    # the cursor catches up to the durable offset.
+    _write_lines(path, [_outcome(timestamp=3.0)], append=True)
+    tailer._handle_change(Change.modified, path)
+    assert [c["timestamp"] for c in collected] == [1.0, 2.0, 3.0]
+    state = tailer._cursor_store.get(str(path))
+    assert state is not None
+    assert state.offset == path.stat().st_size
+
+
+def test_buffered_does_not_reread_unflushed_lines(tmp_path, collected) -> None:
+    """The in-memory live offset advances each event so buffered lines
+    are not re-drained before they flush."""
+    tailer = _buffered_tailer(tmp_path, batch_size=10)
+    path = tmp_path / "sessions" / "default_outcomes.jsonl"
+
+    _write_lines(path, [_outcome(timestamp=1.0)])
+    tailer._handle_change(Change.modified, path)
+    _write_lines(path, [_outcome(timestamp=2.0)], append=True)
+    tailer._handle_change(Change.modified, path)
+
+    # Nothing flushed yet (2 < 10), but the buffer holds exactly two
+    # distinct lines — not four from re-reading.
+    assert collected == []
+    assert len(tailer._buffer) == 2
+    assert [o["timestamp"] for o in tailer._buffer] == [1.0, 2.0]
+
+
+def test_buffered_time_trigger(tmp_path, collected) -> None:
+    tailer = _buffered_tailer(tmp_path, batch_size=100, batch_max_delay_s=10.0)
+    path = tmp_path / "sessions" / "default_outcomes.jsonl"
+    _write_lines(path, [_outcome(timestamp=1.0)])
+    tailer._handle_change(Change.modified, path)
+    # Count threshold (100) not met; buffer holds the line.
+    assert collected == []
+    assert tailer._buffer_started_at is not None
+
+    # Advance the clock past the delay and poke the flush check.
+    tailer._maybe_flush(now=tailer._buffer_started_at + 11.0)
+    assert [c["timestamp"] for c in collected] == [1.0]
+    assert tailer._cursor_store.get(str(path)).offset == path.stat().st_size
+
+
+def test_buffered_shutdown_flush(tmp_path, collected) -> None:
+    tailer = _buffered_tailer(tmp_path, batch_size=100)
+    path = tmp_path / "sessions" / "default_outcomes.jsonl"
+    _write_lines(path, [_outcome(timestamp=1.0), _outcome(timestamp=2.0)])
+    tailer._handle_change(Change.modified, path)
+    assert collected == []  # below threshold, still buffered
+
+    # Explicit flush (what run()'s finally-block does on shutdown).
+    tailer._flush()
+    assert [c["timestamp"] for c in collected] == [1.0, 2.0]
+    assert tailer._cursor_store.get(str(path)).offset == path.stat().st_size
+
+
+def test_buffered_crash_replays_from_last_flush(tmp_path, collected) -> None:
+    """A crash before flush loses no data: a fresh Tailer (cursor at the
+    last flushed offset) re-reads and re-buffers the un-flushed lines."""
+    moneta = tmp_path / "moneta_storage"
+    cursor_path = tmp_path / "cursor.json"
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    path = sessions / "default_outcomes.jsonl"
+
+    tailer_a = Tailer(sessions, CursorStore(cursor_path), moneta, batch_size=10)
+    _write_lines(path, [_outcome(timestamp=1.0), _outcome(timestamp=2.0)])
+    tailer_a._handle_change(Change.modified, path)
+    # "Crash": tailer_a is discarded with its buffer un-flushed. The
+    # persisted cursor never advanced.
+    assert CursorStore(cursor_path).get(str(path)) is None
+
+    # Restart: a fresh Tailer seeds from the (empty) cursor and re-reads.
+    tailer_b = Tailer(sessions, CursorStore(cursor_path), moneta, batch_size=10)
+    tailer_b._handle_change(Change.modified, path)
+    tailer_b._flush()
+    assert [c["timestamp"] for c in collected] == [1.0, 2.0]

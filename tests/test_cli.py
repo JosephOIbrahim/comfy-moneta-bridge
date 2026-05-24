@@ -114,3 +114,141 @@ def test_tail_kicks_off(tmp_path, patched) -> None:
     # Tailer.run is mocked to return immediately, so the command exits 0.
     assert result.exit_code == 0, result.output
     assert "bridge tail watching" in result.output
+
+
+def test_tail_writes_and_cleans_pid_file(tmp_path, patched) -> None:
+    """Hard Rule §13: tail writes tail.pid and removes it on exit."""
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    state_dir = tmp_path / "state"
+    result = runner.invoke(
+        cli.app,
+        [
+            "tail",
+            "--comfy-cozy-root", str(tmp_path),
+            "--moneta-storage", str(tmp_path / "moneta"),
+            "--state-dir", str(state_dir),
+        ],
+    )
+    assert result.exit_code == 0
+    # After clean exit the pid file must be gone.
+    assert not (state_dir / "tail.pid").exists()
+
+
+def test_tail_refuses_when_orchestrate_pid_present(
+    tmp_path, patched
+) -> None:
+    """Hard Rule §13 symmetric guard: tail refuses when orchestrate
+    or mcp is running."""
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "orchestrate.pid").write_text("88", encoding="utf-8")
+    result = runner.invoke(
+        cli.app,
+        [
+            "tail",
+            "--comfy-cozy-root", str(tmp_path),
+            "--moneta-storage", str(tmp_path / "moneta"),
+            "--state-dir", str(state_dir),
+        ],
+    )
+    # Refusal raises OrchestrationLockedError which Typer surfaces as
+    # a non-zero exit with the exception in result.exception.
+    assert result.exit_code != 0
+    assert "Hard Rule §13" in str(result.exception)
+
+
+def test_orchestrate_missing_extras_clear_error(
+    tmp_path, monkeypatch
+) -> None:
+    """If anthropic/mcp can't be imported, give the install hint
+    instead of a stack trace."""
+    real_import = __builtins__["__import__"] if isinstance(
+        __builtins__, dict
+    ) else __import__
+
+    def fake_import(name, *args, **kw):
+        if name in ("anthropic", "mcp"):
+            raise ImportError(f"forced missing: {name}")
+        return real_import(name, *args, **kw)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+    result = runner.invoke(
+        cli.app,
+        [
+            "orchestrate", "do a thing",
+            "--state-dir", str(tmp_path / "state"),
+        ],
+    )
+    assert result.exit_code == 3
+    assert "agents" in result.output
+
+
+def test_mcp_missing_extras_clear_error(tmp_path, monkeypatch) -> None:
+    real_import = __builtins__["__import__"] if isinstance(
+        __builtins__, dict
+    ) else __import__
+
+    def fake_import(name, *args, **kw):
+        if name in ("anthropic", "mcp"):
+            raise ImportError(f"forced missing: {name}")
+        return real_import(name, *args, **kw)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+    result = runner.invoke(
+        cli.app,
+        ["mcp", "--state-dir", str(tmp_path / "state")],
+    )
+    assert result.exit_code == 3
+    assert "agents" in result.output
+
+
+def test_orchestrate_invokes_loop(tmp_path, monkeypatch) -> None:
+    """When extras are installed, orchestrate routes to loop.orchestrate."""
+    called = {}
+
+    async def fake_orchestrate(**kw):
+        called.update(kw)
+
+    monkeypatch.setattr(
+        "comfy_moneta_bridge.agents.loop.orchestrate", fake_orchestrate
+    )
+    result = runner.invoke(
+        cli.app,
+        [
+            "orchestrate", "render a teapot",
+            "--session", "tea",
+            "--state-dir", str(tmp_path / "state"),
+            "--moneta-storage", str(tmp_path / "moneta"),
+            "--max-steps", "3",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert called["goal"] == "render a teapot"
+    assert called["session"] == "tea"
+    assert called["max_steps"] == 3
+
+
+def test_mcp_invokes_server(tmp_path, monkeypatch) -> None:
+    """When extras are installed, mcp routes to mcp_server.run."""
+    called = {}
+
+    def fake_run(**kw):
+        called.update(kw)
+
+    monkeypatch.setattr(
+        "comfy_moneta_bridge.agents.mcp_server.run", fake_run
+    )
+    result = runner.invoke(
+        cli.app,
+        [
+            "mcp",
+            "--state-dir", str(tmp_path / "state"),
+            "--moneta-storage", str(tmp_path / "moneta"),
+            "--tools-only",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert called["tools_only"] is True

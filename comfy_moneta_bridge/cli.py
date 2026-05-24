@@ -1,14 +1,28 @@
-"""User-facing Typer CLI: ``bridge tail`` and ``bridge hydrate``.
+"""User-facing Typer CLI.
 
   bridge tail [--comfy-cozy-root PATH] [--moneta-storage PATH]
               [--state-dir PATH]
       Run the JSONL tailer until SIGINT. Logs deposit events at INFO.
+      Writes {state_dir}/tail.pid for the §13 mutex with orchestrate/mcp.
 
   bridge hydrate <session_name> [--comfy-cozy-root PATH]
                                 [--moneta-storage PATH] [--launch]
       Build sessions/{name}.json from Moneta state. Print a hot-hydrate
       warning + the AUTO_LOAD_SESSION instruction. With --launch, also
       spawn Comfy-Cozy and print the PID.
+
+  bridge recall <query> [--top-k N] [--moneta-storage PATH]
+      Cross-session semantic recall (BGE mode for real text similarity).
+
+  bridge orchestrate <goal> [--session NAME] [--state-dir PATH]
+                            [--comfy-cozy-root PATH] [--max-steps N]
+                            [--model MODEL] [--interactive]
+      Run the internal Claude loop against a local ComfyUI. Requires
+      [agents] extras.
+
+  bridge mcp [--state-dir PATH] [--comfy-cozy-root PATH] [--tools-only]
+      Run the stdio MCP server exposing the bridge's tool surface.
+      Requires [agents] extras.
 """
 
 from __future__ import annotations
@@ -31,6 +45,24 @@ DEFAULT_MONETA_STORAGE = DEFAULT_BRIDGE_STATE_DIR / "moneta"
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
 
+def _ensure_extras(component: str) -> None:
+    """Import-check the [agents] extras and raise a clear error if missing."""
+    missing: list[str] = []
+    for mod in ("anthropic", "mcp", "httpx", "websockets"):
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(mod)
+    if missing:
+        typer.echo(
+            f"bridge {component} requires the [agents] extras. "
+            f"Missing: {', '.join(missing)}.\n"
+            "Install with: pip install 'comfy-moneta-bridge[agents]'",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+
+
 @app.command()
 def tail(
     comfy_cozy_root: Path = typer.Option(
@@ -48,11 +80,39 @@ def tail(
         "--state-dir",
         help="Directory for the bridge cursor file.",
     ),
+    batch_size: int = typer.Option(
+        1,
+        "--batch-size",
+        help=(
+            "Coalesce up to N outcomes into one Moneta snapshot "
+            "(>1 enables cross-event buffering). Default 1 = flush "
+            "every event. Larger N amortizes the run_sleep_pass cost "
+            "but widens the crash-replay window."
+        ),
+    ),
+    batch_max_delay: float = typer.Option(
+        0.0,
+        "--batch-max-delay",
+        help=(
+            "Max seconds an outcome may sit buffered before a forced "
+            "flush (bounds durability latency when --batch-size>1). "
+            "Default 0 = no time-based flush."
+        ),
+    ),
 ) -> None:
     """Watch sessions/*_outcomes.jsonl and ingest each new line into Moneta."""
     logging.basicConfig(level=logging.INFO)
 
     state_dir.mkdir(parents=True, exist_ok=True)
+    # Hard Rule §13: tail and orchestrate/mcp are mutually exclusive.
+    from comfy_moneta_bridge.agents.harness import (
+        PidFileGuard,
+        TAIL_PID_FILE,
+        assert_orchestrate_not_running,
+    )
+
+    assert_orchestrate_not_running(state_dir)
+
     cursor_path = state_dir / "cursor.json"
     cursor_store = CursorStore(cursor_path)
     sessions_dir = comfy_cozy_root / "sessions"
@@ -64,9 +124,13 @@ def tail(
         )
         raise typer.Exit(code=2)
 
-    tailer = Tailer(sessions_dir, cursor_store, moneta_storage)
+    tailer = Tailer(
+        sessions_dir, cursor_store, moneta_storage,
+        batch_size=batch_size, batch_max_delay_s=batch_max_delay,
+    )
     typer.echo(f"bridge tail watching {sessions_dir}")
-    asyncio.run(tailer.run())
+    with PidFileGuard(state_dir / TAIL_PID_FILE):
+        asyncio.run(tailer.run())
 
 
 @app.command()
@@ -135,3 +199,102 @@ def recall(
             "(no matches — check BRIDGE_EMBEDDER_MODE matches the deposit mode)",
             err=True,
         )
+
+
+@app.command()
+def orchestrate(
+    goal: str = typer.Argument(
+        ..., help="Free-text goal description for the agent."
+    ),
+    session: str = typer.Option(
+        "default", "--session", help="Session name to anchor memory under."
+    ),
+    state_dir: Path = typer.Option(
+        DEFAULT_BRIDGE_STATE_DIR,
+        "--state-dir",
+        help="Directory for the bridge cursor file and orchestrate.pid.",
+    ),
+    moneta_storage: Path = typer.Option(
+        DEFAULT_MONETA_STORAGE,
+        "--moneta-storage",
+        help="Directory for Moneta WAL+snapshot files.",
+    ),
+    comfy_cozy_root: Path | None = typer.Option(
+        None,
+        "--comfy-cozy-root",
+        help="Optional Comfy-Cozy root for capsule_write tool calls.",
+    ),
+    max_steps: int = typer.Option(
+        12, "--max-steps", help="Maximum role-machine turns."
+    ),
+    model: str = typer.Option(
+        "claude-opus-4-7", "--model",
+        help="Anthropic model id for the internal Claude loop.",
+    ),
+    interactive: bool = typer.Option(
+        False, "--interactive",
+        help="Require human ack after PLANNER (Hard Rule §16).",
+    ),
+) -> None:
+    """Run the internal Claude agent loop against a local ComfyUI."""
+    _ensure_extras("orchestrate")
+    logging.basicConfig(level=logging.INFO)
+
+    # Lazy import — keeps `bridge --help` and other commands working
+    # without the [agents] extras installed.
+    from comfy_moneta_bridge.agents.loop import (
+        orchestrate as orchestrate_fn,
+    )
+
+    asyncio.run(
+        orchestrate_fn(
+            goal=goal,
+            session=session,
+            moneta_storage_path=moneta_storage,
+            state_dir=state_dir,
+            cozy_root=comfy_cozy_root,
+            model=model,
+            max_steps=max_steps,
+            interactive=interactive,
+        )
+    )
+
+
+@app.command()
+def mcp(
+    state_dir: Path = typer.Option(
+        DEFAULT_BRIDGE_STATE_DIR,
+        "--state-dir",
+        help="Directory for the bridge state and orchestrate.pid.",
+    ),
+    moneta_storage: Path = typer.Option(
+        DEFAULT_MONETA_STORAGE,
+        "--moneta-storage",
+        help="Directory for Moneta WAL+snapshot files.",
+    ),
+    comfy_cozy_root: Path | None = typer.Option(
+        None,
+        "--comfy-cozy-root",
+        help="Optional Comfy-Cozy root for capsule_write tool calls.",
+    ),
+    session: str = typer.Option(
+        "mcp", "--session", help="Session label for deposits."
+    ),
+    tools_only: bool = typer.Option(
+        False, "--tools-only",
+        help="Advertise tools but refuse execution (dry-run mode).",
+    ),
+) -> None:
+    """Run the stdio MCP server exposing the bridge's tool surface."""
+    _ensure_extras("mcp")
+    logging.basicConfig(level=logging.INFO)
+
+    from comfy_moneta_bridge.agents.mcp_server import run as run_mcp
+
+    run_mcp(
+        moneta_storage_path=moneta_storage,
+        state_dir=state_dir,
+        cozy_root=comfy_cozy_root,
+        session=session,
+        tools_only=tools_only,
+    )
