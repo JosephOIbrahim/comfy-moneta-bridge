@@ -55,12 +55,13 @@ def _write_lines(path: Path, lines: list[dict], append: bool = False) -> None:
 def collected(monkeypatch):
     bucket: list[dict] = []
 
-    def fake_ingest(outcome, moneta_storage_path):
-        bucket.append(outcome)
+    def fake_ingest_batch(outcomes, moneta_storage_path):
+        bucket.extend(outcomes)
+        return len(outcomes)
 
     monkeypatch.setattr(
-        "comfy_moneta_bridge.ingest.ingest_outcome",
-        fake_ingest,
+        "comfy_moneta_bridge.ingest.ingest_batch",
+        fake_ingest_batch,
         raising=False,
     )
     return bucket

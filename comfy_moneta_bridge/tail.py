@@ -135,8 +135,11 @@ class Tailer:
         parsed_lines, new_offset = self._drain_complete_lines(
             path, state.offset
         )
-        for line in parsed_lines:
-            ingest.ingest_outcome(line, self._moneta_storage_path)
+        # One handle + one run_sleep_pass for the whole drained batch
+        # (not one snapshot per line). Cursor still advances only after
+        # the batch is durable, so the replay window is unchanged.
+        if parsed_lines:
+            ingest.ingest_batch(parsed_lines, self._moneta_storage_path)
 
         if new_offset != state.offset:
             self._cursor_store.set(
@@ -207,8 +210,8 @@ class Tailer:
         rotated = path.with_suffix(path.suffix + ".1")
         if rotated.exists() and state.offset > 0:
             stranded, _ = self._drain_complete_lines(rotated, state.offset)
-            for line in stranded:
-                ingest.ingest_outcome(line, self._moneta_storage_path)
+            if stranded:
+                ingest.ingest_batch(stranded, self._moneta_storage_path)
 
         if path.exists():
             try:

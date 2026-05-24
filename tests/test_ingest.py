@@ -234,6 +234,65 @@ def test_handle_closed_after_deposit(tmp_path, patched_moneta) -> None:
 
 
 # ----------------------------------------------------------------------
+# Batched deposit (L1/L2): N deposits, ONE handle, ONE run_sleep_pass
+# ----------------------------------------------------------------------
+
+
+def test_ingest_batch_one_handle_one_snapshot(tmp_path, patched_moneta) -> None:
+    outcomes = [_outcome(timestamp=float(i)) for i in range(5)]
+    deposited = ingest.ingest_batch(outcomes, tmp_path / "moneta")
+    assert deposited == 5
+    # Exactly ONE Moneta handle for the whole batch.
+    assert len(patched_moneta.instances) == 1
+    inst = patched_moneta.instances[0]
+    # Five deposits, ONE run_sleep_pass.
+    assert len(inst.deposit_calls) == 5
+    assert inst.sleep_pass_count == 1
+    # Order: enter, 5×deposit, sleep_pass, exit.
+    assert [e[0] for e in inst.events] == (
+        ["enter"] + ["deposit"] * 5 + ["sleep_pass", "exit"]
+    )
+
+
+def test_ingest_batch_empty_opens_no_handle(tmp_path, patched_moneta) -> None:
+    assert ingest.ingest_batch([], tmp_path / "moneta") == 0
+    assert patched_moneta.instances == []
+
+
+def test_ingest_batch_skips_invalid_keeps_valid(
+    tmp_path, patched_moneta
+) -> None:
+    outcomes = [
+        _outcome(timestamp=1.0),
+        _outcome(timestamp=2.0, schema_version=2),  # dropped
+        _outcome(timestamp=3.0),
+    ]
+    deposited = ingest.ingest_batch(outcomes, tmp_path / "moneta")
+    assert deposited == 2
+    inst = patched_moneta.instances[0]
+    assert len(inst.deposit_calls) == 2
+    assert inst.sleep_pass_count == 1
+
+
+def test_ingest_batch_all_invalid_opens_no_handle(
+    tmp_path, patched_moneta
+) -> None:
+    outcomes = [_outcome(schema_version=9), _outcome(schema_version=2)]
+    assert ingest.ingest_batch(outcomes, tmp_path / "moneta") == 0
+    assert patched_moneta.instances == []
+
+
+def test_ingest_outcome_delegates_to_batch(tmp_path, patched_moneta) -> None:
+    """The single-line wrapper still produces exactly one deposit +
+    one run_sleep_pass (event order unchanged)."""
+    ingest.ingest_outcome(_outcome(), tmp_path / "moneta")
+    inst = patched_moneta.instances[0]
+    assert [e[0] for e in inst.events] == [
+        "enter", "deposit", "sleep_pass", "exit",
+    ]
+
+
+# ----------------------------------------------------------------------
 # Real-Moneta durability test (no mock)
 # ----------------------------------------------------------------------
 
