@@ -4,11 +4,32 @@ from __future__ import annotations
 
 import pytest
 
+import re
+
 from comfy_moneta_bridge.agents.constitution import (
     ROLE_ALLOWLIST,
     default_constitution_path,
     load_constitution,
 )
+
+
+def _parse_agents_md_allowlist(text: str) -> dict[str, set[str]]:
+    """Extract the role→tool table from AGENTS.md §1.
+
+    Rows look like:
+        | **EXECUTOR** | `workflow_validate`, `workflow_submit`, ... |
+    """
+    parsed: dict[str, set[str]] = {}
+    row = re.compile(r"^\|\s*\*\*([A-Z]+)\*\*\s*\|(.+)\|\s*$")
+    for line in text.splitlines():
+        m = row.match(line.strip())
+        if not m:
+            continue
+        role = m.group(1)
+        tools = set(re.findall(r"`([^`]+)`", m.group(2)))
+        if tools:
+            parsed[role] = tools
+    return parsed
 from comfy_moneta_bridge.agents.roles import (
     ROLE_ORDER,
     ROLES,
@@ -38,6 +59,20 @@ def test_load_constitution_custom_path(tmp_path) -> None:
     p = tmp_path / "my_agents.md"
     p.write_text("# custom constitution\n", encoding="utf-8")
     assert load_constitution(p) == "# custom constitution\n"
+
+
+def test_agents_md_allowlist_matches_code() -> None:
+    """R1 drift guard: the role→tool table in AGENTS.md §1 must match
+    constitution.ROLE_ALLOWLIST exactly. Editing one without the other
+    fails here, so the prose and the runtime gate can't diverge."""
+    text = load_constitution()
+    from_doc = _parse_agents_md_allowlist(text)
+    assert from_doc == ROLE_ALLOWLIST, (
+        "AGENTS.md §1 role→tool table is out of sync with "
+        "constitution.ROLE_ALLOWLIST.\n"
+        f"  in doc only: {{k: from_doc[k] - ROLE_ALLOWLIST.get(k, set()) for k in from_doc}}\n"
+        f"  in code only: {{k: ROLE_ALLOWLIST[k] - from_doc.get(k, set()) for k in ROLE_ALLOWLIST}}"
+    )
 
 
 def test_role_allowlist_has_all_roles() -> None:

@@ -33,6 +33,7 @@ ROLE_ALLOWLIST: dict[str, set[str]] = {
     "EXECUTOR": {
         "workflow_validate",
         "workflow_submit",
+        "workflow_await_result",
         "workflow_interrupt",
     },
     "CRITIC": {"recall_memory"},

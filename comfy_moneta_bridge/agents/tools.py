@@ -163,6 +163,18 @@ async def _tool_workflow_interrupt(args: dict, ctx: AgentContext) -> dict:
     return {"interrupted": True}
 
 
+async def _tool_workflow_await_result(args: dict, ctx: AgentContext) -> dict:
+    if ctx.comfy_client is None:
+        raise RefusalError(
+            "workflow_await_result requires an active ComfyClient in context"
+        )
+    prompt_id = args.get("prompt_id")
+    if not prompt_id:
+        raise RefusalError("workflow_await_result requires 'prompt_id'")
+    timeout_s = float(args.get("timeout_s", 300.0))
+    return await ctx.comfy_client.await_result(prompt_id, timeout_s=timeout_s)
+
+
 async def _tool_recall_memory(args: dict, ctx: AgentContext) -> dict:
     results = recall_fn(
         args["query"], ctx.moneta_storage_path,
@@ -363,6 +375,24 @@ ALL_TOOLS: list[ToolSpec] = [
         description="Interrupt the currently-executing ComfyUI prompt.",
         input_schema={"type": "object", "properties": {}},
         func=_tool_workflow_interrupt,
+    ),
+    ToolSpec(
+        name="workflow_await_result",
+        description=(
+            "Block until a submitted prompt_id finishes rendering, then "
+            "return its result. Returns {status: success|error|timeout, "
+            "prompt_id, history}. Call this after workflow_submit so the "
+            "render outcome can be evaluated."
+        ),
+        input_schema={
+            "type": "object",
+            "required": ["prompt_id"],
+            "properties": {
+                "prompt_id": {"type": "string"},
+                "timeout_s": {"type": "number", "minimum": 1},
+            },
+        },
+        func=_tool_workflow_await_result,
     ),
     ToolSpec(
         name="recall_memory",

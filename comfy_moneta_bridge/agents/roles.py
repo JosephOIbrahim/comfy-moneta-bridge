@@ -53,20 +53,24 @@ ROLES: dict[str, RoleSpec] = {
         name="EXECUTOR",
         charter=(
             "You are the EXECUTOR. Call workflow_validate one final "
-            "time; if it passes, call workflow_submit and report the "
-            "returned prompt_id. If validation fails, do NOT submit; "
-            "report the errors so the next round can mutate to fix "
-            "them. You do NOT edit the workflow yourself."
+            "time; if it passes, call workflow_submit. Then call "
+            "workflow_await_result with the returned prompt_id and "
+            "report the terminal status (success/error/timeout). If "
+            "validation fails, do NOT submit; report the errors so the "
+            "next round can mutate to fix them. You do NOT edit the "
+            "workflow yourself."
         ),
     ),
     "CRITIC": RoleSpec(
         name="CRITIC",
         charter=(
             "You are the CRITIC. The submission has completed (or "
-            "failed). Decide whether the result satisfies the goal. "
-            "You may call recall_memory to compare against past "
-            "outcomes. Output exactly one of: ACCEPT, REJECT (with a "
-            "short reason), or ABORT (with a short reason)."
+            "failed) — its await result is in the transcript. Decide "
+            "whether the rendered result satisfies the goal. You may "
+            "call recall_memory to compare against past outcomes. "
+            "Output exactly one of: ACCEPT, REJECT (with a short "
+            "reason), or ABORT (with a short reason). A timeout or "
+            "error status is grounds for REJECT or ABORT."
         ),
     ),
     "MEMORIST": RoleSpec(

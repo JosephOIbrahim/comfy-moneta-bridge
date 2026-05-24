@@ -80,6 +80,7 @@ def test_expected_tool_names_present() -> None:
         "workflow_remove_node",
         "workflow_validate",
         "workflow_submit",
+        "workflow_await_result",
         "workflow_interrupt",
         "recall_memory",
         "deposit_outcome",
@@ -175,6 +176,49 @@ async def test_workflow_submit_happy_path(tmp_path) -> None:
     result = await dispatch("workflow_submit", {}, ctx)
     assert result["prompt_id"] == "fake-prompt-id"
     assert "1" in submitted["payload"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_await_result_happy_path(tmp_path) -> None:
+    class _StubClient:
+        async def await_result(self, prompt_id, timeout_s=300.0):
+            return {"status": "success", "prompt_id": prompt_id,
+                    "history": {prompt_id: {"status": {}}}}
+
+    ctx = AgentContext(
+        moneta_storage_path=tmp_path,
+        state_dir=tmp_path,
+        comfy_client=_StubClient(),  # type: ignore[arg-type]
+    )
+    result = await dispatch(
+        "workflow_await_result", {"prompt_id": "p1"}, ctx
+    )
+    assert result["status"] == "success"
+    assert result["prompt_id"] == "p1"
+
+
+@pytest.mark.asyncio
+async def test_workflow_await_result_no_client_refused(tmp_path) -> None:
+    ctx = AgentContext(moneta_storage_path=tmp_path, state_dir=tmp_path)
+    with pytest.raises(RefusalError, match="ComfyClient"):
+        await dispatch("workflow_await_result", {"prompt_id": "p1"}, ctx)
+
+
+@pytest.mark.asyncio
+async def test_workflow_await_result_missing_prompt_id_refused(
+    tmp_path,
+) -> None:
+    class _StubClient:
+        async def await_result(self, prompt_id, timeout_s=300.0):  # pragma: no cover
+            raise AssertionError("should not be called")
+
+    ctx = AgentContext(
+        moneta_storage_path=tmp_path,
+        state_dir=tmp_path,
+        comfy_client=_StubClient(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(RefusalError, match="prompt_id"):
+        await dispatch("workflow_await_result", {}, ctx)
 
 
 @pytest.mark.asyncio

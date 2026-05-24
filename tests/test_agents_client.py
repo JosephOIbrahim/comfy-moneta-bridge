@@ -205,3 +205,176 @@ async def test_delete_queue_item(httpx_mock) -> None:
     assert len(reqs) == 1
     body = reqs[0].read()
     assert b"abc-123" in body
+
+
+# ─── stream_progress (WS path) + await_result ─────────────────────────
+
+import json  # noqa: E402
+
+from comfy_moneta_bridge.agents import client as client_mod  # noqa: E402
+
+
+class _FakeWS:
+    """Async-context-manager + async-iterator standing in for a
+    websockets connection. Yields the canned frames then stops."""
+
+    def __init__(self, frames: list[str]) -> None:
+        self._frames = list(frames)
+
+    async def __aenter__(self) -> "_FakeWS":
+        return self
+
+    async def __aexit__(self, *a) -> bool:
+        return False
+
+    def __aiter__(self) -> "_FakeWS":
+        return self
+
+    async def __anext__(self) -> str:
+        if not self._frames:
+            raise StopAsyncIteration
+        return self._frames.pop(0)
+
+
+def _fake_connect(frames: list[str]):
+    def _connect(url, *a, **kw):
+        return _FakeWS(frames)
+    return _connect
+
+
+@pytest.mark.asyncio
+async def test_stream_progress_terminates_on_executing_done(
+    monkeypatch,
+) -> None:
+    frames = [
+        json.dumps({"type": "status", "data": {}}),
+        json.dumps({"type": "executing",
+                    "data": {"node": "3", "prompt_id": "p1"}}),
+        json.dumps({"type": "executing",
+                    "data": {"node": None, "prompt_id": "p1"}}),
+        json.dumps({"type": "should_not_be_reached", "data": {}}),
+    ]
+    monkeypatch.setattr(client_mod.websockets, "connect",
+                        _fake_connect(frames))
+    async with ComfyClient() as c:
+        events = [e async for e in c.stream_progress("p1")]
+    # Stops at the terminal node=None event; the trailing frame is
+    # never yielded.
+    assert len(events) == 3
+    assert events[-1]["data"]["node"] is None
+
+
+@pytest.mark.asyncio
+async def test_stream_progress_terminates_on_execution_error(
+    monkeypatch,
+) -> None:
+    frames = [
+        json.dumps({"type": "executing",
+                    "data": {"node": "3", "prompt_id": "p1"}}),
+        json.dumps({"type": "execution_error",
+                    "data": {"prompt_id": "p1"}}),
+        json.dumps({"type": "should_not_be_reached", "data": {}}),
+    ]
+    monkeypatch.setattr(client_mod.websockets, "connect",
+                        _fake_connect(frames))
+    async with ComfyClient() as c:
+        events = [e async for e in c.stream_progress("p1")]
+    assert events[-1]["type"] == "execution_error"
+    assert len(events) == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_progress_skips_binary_and_bad_json(
+    monkeypatch,
+) -> None:
+    frames = [
+        b"\x00\x01binary-preview-frame",
+        "not json at all",
+        json.dumps({"type": "executing",
+                    "data": {"node": None, "prompt_id": "p1"}}),
+    ]
+    monkeypatch.setattr(client_mod.websockets, "connect",
+                        _fake_connect(frames))
+    async with ComfyClient() as c:
+        events = [e async for e in c.stream_progress("p1")]
+    # Binary + bad-json frames are skipped; only the terminal event
+    # is yielded.
+    assert events == [{"type": "executing",
+                       "data": {"node": None, "prompt_id": "p1"}}]
+
+
+@pytest.mark.asyncio
+async def test_await_result_short_circuit_when_already_complete(
+    httpx_mock,
+) -> None:
+    httpx_mock.add_response(
+        url="http://127.0.0.1:8188/history/p1",
+        json={"p1": {"status": {"status_str": "success", "completed": True}}},
+    )
+    async with ComfyClient() as c:
+        result = await c.await_result("p1")
+    assert result["status"] == "success"
+    assert result["prompt_id"] == "p1"
+    # Only the one history call — no WS connection needed.
+    assert len(httpx_mock.get_requests()) == 1
+
+
+@pytest.mark.asyncio
+async def test_await_result_streams_then_success(
+    httpx_mock, monkeypatch,
+) -> None:
+    httpx_mock.add_response(
+        url="http://127.0.0.1:8188/history/p1", json={},
+    )
+    httpx_mock.add_response(
+        url="http://127.0.0.1:8188/history/p1",
+        json={"p1": {"status": {"status_str": "success"}}},
+    )
+    frames = [json.dumps({"type": "executing",
+                          "data": {"node": None, "prompt_id": "p1"}})]
+    monkeypatch.setattr(client_mod.websockets, "connect",
+                        _fake_connect(frames))
+    async with ComfyClient() as c:
+        result = await c.await_result("p1", timeout_s=5)
+    assert result["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_await_result_streams_then_error(
+    httpx_mock, monkeypatch,
+) -> None:
+    httpx_mock.add_response(
+        url="http://127.0.0.1:8188/history/p1", json={},
+    )
+    httpx_mock.add_response(
+        url="http://127.0.0.1:8188/history/p1",
+        json={"p1": {"status": {"status_str": "error"}}},
+    )
+    frames = [json.dumps({"type": "execution_error",
+                          "data": {"prompt_id": "p1"}})]
+    monkeypatch.setattr(client_mod.websockets, "connect",
+                        _fake_connect(frames))
+    async with ComfyClient() as c:
+        result = await c.await_result("p1", timeout_s=5)
+    assert result["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_await_result_timeout(httpx_mock, monkeypatch) -> None:
+    import asyncio
+
+    httpx_mock.add_response(
+        url="http://127.0.0.1:8188/history/p1", json={},
+    )
+    httpx_mock.add_response(
+        url="http://127.0.0.1:8188/history/p1", json={},
+    )
+
+    async def _hang(prompt_id):
+        await asyncio.sleep(10)
+        yield {}
+
+    async with ComfyClient() as c:
+        monkeypatch.setattr(c, "stream_progress", _hang)
+        result = await c.await_result("p1", timeout_s=0.05)
+    assert result["status"] == "timeout"

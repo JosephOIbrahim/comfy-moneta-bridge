@@ -24,7 +24,7 @@ the allowlist is a refusal-class violation.
 |---|---|
 | **PLANNER** | `workflow_load`, `recall_memory` |
 | **MUTATOR** | `workflow_load`, `workflow_mutate_node`, `workflow_connect`, `workflow_remove_node`, `workflow_validate` |
-| **EXECUTOR** | `workflow_validate`, `workflow_submit`, `workflow_interrupt` |
+| **EXECUTOR** | `workflow_validate`, `workflow_submit`, `workflow_await_result`, `workflow_interrupt` |
 | **CRITIC** | `recall_memory` |
 | **MEMORIST** | `deposit_outcome`, `capsule_write`, `recall_memory` |
 

@@ -185,3 +185,76 @@ class ComfyClient:
                     event.get("data", {}).get("prompt_id") == prompt_id
                 ):
                     return
+
+    async def await_result(
+        self, prompt_id: str, timeout_s: float = 300.0
+    ) -> dict:
+        """Block until ``prompt_id`` completes; return its result.
+
+        Robust against the connect-after-completion race: checks
+        ``/history`` first (if the prompt already finished before we
+        started streaming, the WS would never replay the terminal
+        event and we'd hang). Otherwise streams progress until the
+        terminal ``executing/node=None`` or ``execution_error`` event,
+        then fetches ``/history``. On timeout, falls back to one final
+        ``/history`` read.
+
+        Returns ``{"status": "success"|"error"|"timeout",
+        "prompt_id": ..., "history": {...}}``.
+        """
+        import asyncio
+
+        # Short-circuit: already complete?
+        history = await self.get_history(prompt_id)
+        if prompt_id in history:
+            return {
+                "status": _history_status(history, prompt_id),
+                "prompt_id": prompt_id,
+                "history": history,
+            }
+
+        async def _drain() -> str:
+            async for event in self.stream_progress(prompt_id):
+                if event.get("type") == "execution_error" and (
+                    event.get("data", {}).get("prompt_id") == prompt_id
+                ):
+                    return "error"
+            return "success"
+
+        try:
+            stream_status = await asyncio.wait_for(
+                _drain(), timeout=timeout_s
+            )
+        except asyncio.TimeoutError:
+            history = await self.get_history(prompt_id)
+            return {
+                "status": "timeout",
+                "prompt_id": prompt_id,
+                "history": history,
+            }
+
+        history = await self.get_history(prompt_id)
+        status = stream_status
+        if status == "success" and prompt_id in history:
+            status = _history_status(history, prompt_id)
+        return {
+            "status": status,
+            "prompt_id": prompt_id,
+            "history": history,
+        }
+
+
+def _history_status(history: dict, prompt_id: str) -> str:
+    """Map a ComfyUI /history entry to success|error.
+
+    ComfyUI's history record carries ``status.status_str`` (e.g.
+    ``"success"``) and ``status.completed`` once a prompt finishes.
+    Absent/odd shapes default to ``"success"`` since the prompt is
+    present in history at all (it ran).
+    """
+    entry = history.get(prompt_id) or {}
+    status = entry.get("status") or {}
+    status_str = status.get("status_str")
+    if status_str == "error":
+        return "error"
+    return "success"
