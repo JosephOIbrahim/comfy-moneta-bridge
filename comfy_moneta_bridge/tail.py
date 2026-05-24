@@ -35,6 +35,7 @@ import asyncio
 import fnmatch
 import json
 import logging
+import time
 from pathlib import Path
 
 from watchfiles import Change, awatch
@@ -55,10 +56,82 @@ class Tailer:
         sessions_dir: Path,
         cursor_store: CursorStore,
         moneta_storage_path: Path,
+        batch_size: int = 1,
+        batch_max_delay_s: float = 0.0,
     ) -> None:
         self._sessions_dir = Path(sessions_dir)
         self._cursor_store = cursor_store
         self._moneta_storage_path = Path(moneta_storage_path)
+        # Opt-in cross-event batching (L1). Default (size=1, delay=0)
+        # flushes every event — byte-identical to the v0 behavior.
+        self._batch_size = max(1, int(batch_size))
+        self._batch_max_delay_s = max(0.0, float(batch_max_delay_s))
+        # Buffered-mode state. ``_live_state`` is the in-memory
+        # authoritative (inode, read-offset) per watched file; the
+        # persisted cursor lags it and only catches up on flush, so a
+        # crash re-reads from the last *durable* offset (wider replay
+        # window — the documented batching tradeoff).
+        self._buffer: list[dict] = []
+        self._live_state: dict[str, WatchState] = {}
+        self._pending_keys: set[str] = set()
+        self._buffer_started_at: float | None = None
+
+    @property
+    def _batching_enabled(self) -> bool:
+        return self._batch_size > 1 or self._batch_max_delay_s > 0
+
+    def _get_state(self, watched_key: str) -> WatchState | None:
+        """Read the drain state. Default mode reads the persisted
+        cursor; buffered mode reads the in-memory live state (seeded
+        once from the cursor) so deferred-cursor events don't re-read
+        already-buffered lines."""
+        if not self._batching_enabled:
+            return self._cursor_store.get(watched_key)
+        if watched_key not in self._live_state:
+            seeded = self._cursor_store.get(watched_key)
+            if seeded is not None:
+                self._live_state[watched_key] = seeded
+        return self._live_state.get(watched_key)
+
+    def _set_state(self, watched_key: str, state: WatchState) -> None:
+        """Advance the drain state. Default mode writes the cursor
+        immediately; buffered mode advances only the in-memory live
+        state and marks the key pending — the cursor is persisted on
+        flush, after the buffered batch is durable."""
+        if not self._batching_enabled:
+            self._cursor_store.set(watched_key, state)
+            return
+        self._live_state[watched_key] = state
+        self._pending_keys.add(watched_key)
+        if self._buffer_started_at is None:
+            self._buffer_started_at = time.monotonic()
+
+    def _maybe_flush(self, now: float | None = None) -> None:
+        if not self._buffer and not self._pending_keys:
+            return
+        now = time.monotonic() if now is None else now
+        count_trigger = len(self._buffer) >= self._batch_size
+        time_trigger = (
+            self._batch_max_delay_s > 0
+            and self._buffer_started_at is not None
+            and (now - self._buffer_started_at) >= self._batch_max_delay_s
+        )
+        if count_trigger or time_trigger:
+            self._flush()
+
+    def _flush(self) -> None:
+        """Deposit the buffered batch (one handle + one run_sleep_pass)
+        then persist every pending cursor. Order matters: the cursor is
+        advanced only AFTER ``ingest_batch`` returns durable, preserving
+        Hard Rule §12 — a crash before this point re-reads from the last
+        flushed offset."""
+        if self._buffer:
+            ingest.ingest_batch(self._buffer, self._moneta_storage_path)
+            self._buffer = []
+        for key in self._pending_keys:
+            self._cursor_store.set(key, self._live_state[key])
+        self._pending_keys = set()
+        self._buffer_started_at = None
 
     async def run(self, stop_event: asyncio.Event | None = None) -> None:
         """Watch the sessions directory until ``stop_event`` is set.
@@ -66,21 +139,38 @@ class Tailer:
         Yields control to asyncio between change-set batches. Each event
         is dispatched to ``_handle_change``. Filename filtering happens
         here so non-matching writes (e.g. ``_goals.json``) are ignored.
+
+        In buffered mode the watch yields on timeout so the delay-based
+        flush fires even when no new events arrive, and a final flush on
+        exit persists anything still buffered at shutdown.
         """
-        async for change_set in awatch(
-            self._sessions_dir, stop_event=stop_event
-        ):
-            for change, raw_path in change_set:
-                path = Path(raw_path)
-                if not fnmatch.fnmatch(path.name, OUTCOMES_GLOB):
-                    continue
-                try:
-                    self._handle_change(change, path)
-                except Exception:  # noqa: BLE001
-                    _logger.exception(
-                        "tail._handle_change raised on %s; cursor not advanced",
-                        path,
-                    )
+        watch_kwargs: dict = {"stop_event": stop_event}
+        if self._batching_enabled and self._batch_max_delay_s > 0:
+            watch_kwargs["yield_on_timeout"] = True
+            watch_kwargs["rust_timeout"] = max(
+                50, int(self._batch_max_delay_s * 1000)
+            )
+        try:
+            async for change_set in awatch(
+                self._sessions_dir, **watch_kwargs
+            ):
+                for change, raw_path in change_set:
+                    path = Path(raw_path)
+                    if not fnmatch.fnmatch(path.name, OUTCOMES_GLOB):
+                        continue
+                    try:
+                        self._handle_change(change, path)
+                    except Exception:  # noqa: BLE001
+                        _logger.exception(
+                            "tail._handle_change raised on %s; cursor "
+                            "not advanced", path,
+                        )
+                if self._batching_enabled:
+                    self._maybe_flush()
+        finally:
+            if self._batching_enabled:
+                # Shutdown: persist whatever is still buffered.
+                self._flush()
 
     def _handle_change(self, change: Change, path: Path) -> None:
         """Route one filesystem event to drain / rotation logic.
@@ -91,7 +181,7 @@ class Tailer:
         is durable on its return).
         """
         watched_key = str(path)
-        state = self._cursor_store.get(watched_key) or WatchState(
+        state = self._get_state(watched_key) or WatchState(
             inode=0, offset=0
         )
 
@@ -116,8 +206,12 @@ class Tailer:
             return
 
         if rotation:
+            # Flush any pre-rotation buffer first so its lines deposit
+            # (and their cursor persists) before the offset resets to 0.
+            if self._batching_enabled:
+                self._flush()
             state = self._handle_rotation(path, state)
-            self._cursor_store.set(watched_key, state)
+            self._set_state(watched_key, state)
             if not path.exists():
                 # New file not yet created. Wait for the next event.
                 return
@@ -135,16 +229,31 @@ class Tailer:
         parsed_lines, new_offset = self._drain_complete_lines(
             path, state.offset
         )
-        # One handle + one run_sleep_pass for the whole drained batch
-        # (not one snapshot per line). Cursor still advances only after
-        # the batch is durable, so the replay window is unchanged.
-        if parsed_lines:
-            ingest.ingest_batch(parsed_lines, self._moneta_storage_path)
-
-        if new_offset != state.offset:
-            self._cursor_store.set(
-                watched_key, WatchState(inode=state.inode, offset=new_offset)
-            )
+        # Default mode: one handle + one run_sleep_pass for this drained
+        # batch, cursor advances now (replay window unchanged from v0).
+        # Buffered mode: stage the lines and defer both the deposit and
+        # the cursor advance to the next flush.
+        if self._batching_enabled:
+            if parsed_lines:
+                self._buffer.extend(parsed_lines)
+                if self._buffer_started_at is None:
+                    self._buffer_started_at = time.monotonic()
+            if new_offset != state.offset:
+                self._set_state(
+                    watched_key,
+                    WatchState(inode=state.inode, offset=new_offset),
+                )
+            self._maybe_flush()
+        else:
+            if parsed_lines:
+                ingest.ingest_batch(
+                    parsed_lines, self._moneta_storage_path
+                )
+            if new_offset != state.offset:
+                self._set_state(
+                    watched_key,
+                    WatchState(inode=state.inode, offset=new_offset),
+                )
 
     def _drain_complete_lines(
         self, path: Path, start_offset: int

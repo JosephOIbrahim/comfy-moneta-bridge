@@ -80,6 +80,25 @@ def tail(
         "--state-dir",
         help="Directory for the bridge cursor file.",
     ),
+    batch_size: int = typer.Option(
+        1,
+        "--batch-size",
+        help=(
+            "Coalesce up to N outcomes into one Moneta snapshot "
+            "(>1 enables cross-event buffering). Default 1 = flush "
+            "every event. Larger N amortizes the run_sleep_pass cost "
+            "but widens the crash-replay window."
+        ),
+    ),
+    batch_max_delay: float = typer.Option(
+        0.0,
+        "--batch-max-delay",
+        help=(
+            "Max seconds an outcome may sit buffered before a forced "
+            "flush (bounds durability latency when --batch-size>1). "
+            "Default 0 = no time-based flush."
+        ),
+    ),
 ) -> None:
     """Watch sessions/*_outcomes.jsonl and ingest each new line into Moneta."""
     logging.basicConfig(level=logging.INFO)
@@ -105,7 +124,10 @@ def tail(
         )
         raise typer.Exit(code=2)
 
-    tailer = Tailer(sessions_dir, cursor_store, moneta_storage)
+    tailer = Tailer(
+        sessions_dir, cursor_store, moneta_storage,
+        batch_size=batch_size, batch_max_delay_s=batch_max_delay,
+    )
     typer.echo(f"bridge tail watching {sessions_dir}")
     with PidFileGuard(state_dir / TAIL_PID_FILE):
         asyncio.run(tailer.run())

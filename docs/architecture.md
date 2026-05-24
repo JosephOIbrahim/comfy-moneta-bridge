@@ -169,14 +169,49 @@ limitation.
 
 ### `ingest.py` — deposit + run_sleep_pass
 
-The pipeline. Validates `schema_version == 1`, synthesizes the vector,
-opens an ephemeral handle, calls `m.deposit()` then `m.run_sleep_pass()`,
-exits the with-block. The function returns only after `run_sleep_pass`
-has completed — clean return == on-disk durability.
+The pipeline. `ingest_batch(outcomes, path)` validates+embeds each
+outcome (dropping `schema_version != 1`), opens one ephemeral handle,
+deposits all, calls `m.run_sleep_pass()` **once**, exits the with-block.
+The function returns only after `run_sleep_pass` has completed — clean
+return == on-disk durability. `ingest_outcome` is a thin single-line
+wrapper over `ingest_batch([outcome])`.
 
 `MonetaConfig.embedding_dim` is pinned to 384 so dim mismatch surfaces
 at deposit time as a `ValueError` rather than silently corrupting the
 vector index.
+
+### Batched-deposit layer (v0.3 — realizes the v1 candidate)
+
+`run_sleep_pass()` snapshots the entire ECS to disk and is the
+per-deposit cost ceiling (benchmark above: 28 ms @0 → 685 ms @1000 →
+4518 ms @10000). Two batching tiers reduce how often it runs:
+
+- **Per-drain coalescing (always on).** `tail._handle_change` deposits
+  a whole drained batch via one `ingest_batch` call — one snapshot for
+  the batch instead of one per line. The cursor still advances only at
+  end-of-drain, so the crash-replay window is **unchanged** from v0.
+  This is a strict, contract-preserving win for multi-line drains
+  (rotation catch-up, cold-start backlog).
+
+- **Cross-event buffering (opt-in).** `--batch-size N` / `--batch-max-delay T`
+  (Tailer `batch_size` / `batch_max_delay_s`) accumulate outcomes
+  across watch events and flush when `count >= N` **or** the oldest
+  buffered outcome is older than `T` seconds, or on shutdown. This
+  amortizes the snapshot across a sustained single-line append stream
+  (the case per-drain coalescing can't help).
+
+  **Durability tradeoff (why it is opt-in, default off):** buffered
+  mode keeps an in-memory `_live_state` (inode + read offset) seeded
+  from the persisted cursor, and the cursor is persisted only on flush.
+  So the crash-replay/duplicate window grows from one watch event to
+  one flush interval (≤ N outcomes or ≤ T seconds). No data is lost —
+  a crash re-reads from the last *flushed* offset and re-deposits the
+  un-flushed lines (Moneta owns idempotency) — but the duplicate span
+  is wider. The default (`N=1, T=0`) flushes every event and is
+  byte-identical to v0. Pair `N>1` with a small `T` to bound how long
+  an outcome can sit non-durable. Hard Rule §6 (ephemeral handles) is
+  preserved: buffering holds raw outcomes in memory, not an open
+  Moneta handle — the handle is still opened only at flush.
 
 ### `capsule.py` — query -> schema_v2
 
