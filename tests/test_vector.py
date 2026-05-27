@@ -80,9 +80,10 @@ def test_empty_string_handled() -> None:
 # ----------------------------------------------------------------------
 
 
-def test_from_env_default_is_synthetic(monkeypatch) -> None:
+def test_from_env_default_is_bge(monkeypatch) -> None:
+    # Default flipped to bge (leaf L4 / SPEC P2): real embedder by default.
     monkeypatch.delenv(ENV_VAR, raising=False)
-    assert from_env() == "synthetic"
+    assert from_env() == "bge"
 
 
 def test_from_env_explicit_synthetic(monkeypatch) -> None:
@@ -107,12 +108,12 @@ def test_from_env_strips_whitespace(monkeypatch) -> None:
 
 def test_from_env_unknown_falls_back(monkeypatch) -> None:
     monkeypatch.setenv(ENV_VAR, "bogus_mode")
-    assert from_env() == "synthetic"
+    assert from_env() == "bge"  # unrecognised -> default (now bge)
 
 
 def test_from_env_empty_falls_back(monkeypatch) -> None:
     monkeypatch.setenv(ENV_VAR, "")
-    assert from_env() == "synthetic"
+    assert from_env() == "bge"  # empty -> default (now bge)
 
 
 # ----------------------------------------------------------------------
@@ -217,7 +218,7 @@ def test_encode_outcome_caches_singleton(monkeypatch) -> None:
     constructed: list[object] = []
 
     class _ConstructorSpy:
-        def __init__(self, name):
+        def __init__(self, name, **kwargs):  # accept local_files_only (L3)
             constructed.append(name)
 
         def encode(self, text, **kwargs):
