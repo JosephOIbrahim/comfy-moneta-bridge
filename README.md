@@ -30,7 +30,7 @@ or Moneta source; both are frozen as law.
 flowchart TD
     Outcomes[outcomes.jsonl<br/>append]
     Tail[tail.py<br/>open-read-close]
-    Vector[vector.py<br/>synthesize_vector session]
+    Vector[vector.py<br/>encode_outcome · BGE-384 default<br/>synthesize_vector fallback]
     Ingest[ingest.py<br/>json.dumps payload]
     Moneta1[Moneta context manager<br/>m.deposit payload, embedding]
     Sleep[m.run_sleep_pass<br/>Hard Rule §12]
@@ -80,7 +80,8 @@ flowchart TD
     Vector2[vector.py<br/>same session vector as ingest]
     Moneta2[Moneta context manager<br/>m.query embedding, limit=1000]
     Memories[matched memories list]
-    Capsule[capsule.py<br/>filter by session<br/>sort chronologically<br/>translate to schema_v2]
+    Capsule[capsule.py<br/>session-local notes<br/>+ cross-session fold-in<br/>schema_v2]
+    Recall[recall.py<br/>top-k cross-session<br/>bge semantic match]
     Capsule_File[sessions/name.json<br/>atomic temp+rename]
     Launch[Comfy-Cozy<br/>AUTO_LOAD_SESSION env]
 
@@ -88,6 +89,8 @@ flowchart TD
     Vector2 -->|with-block enter| Moneta2
     Moneta2 -->|read-only query| Memories
     Memories --> Capsule
+    Capsule -->|content query| Recall
+    Recall -->|other-session notes| Capsule
     Capsule --> Capsule_File
     Capsule_File -->|optional --launch flag| Launch
 
@@ -95,14 +98,16 @@ flowchart TD
     classDef consumer  fill:#C25B3F,stroke:#C25B3F,color:#E8E8E8
     classDef bridge    fill:#888888,stroke:#888888,color:#E8E8E8
 
-    class CLI,Vector2,Capsule bridge
+    class CLI,Vector2,Capsule,Recall bridge
     class Moneta2,Memories substrate
     class Capsule_File,Launch consumer
 ```
 
 Hydrate path: a session capsule is reconstructed from Moneta state and
-written into Comfy-Cozy's session folder. Optionally, the bridge spawns
-Comfy-Cozy with `AUTO_LOAD_SESSION` set.
+written into Comfy-Cozy's session folder. In bge mode the capsule also
+folds in the top-k semantically-related memories from *other* sessions
+(`recall.py`) as `observation` notes — this is the cross-session payoff.
+Optionally, the bridge spawns Comfy-Cozy with `AUTO_LOAD_SESSION` set.
 
 ```mermaid
 flowchart LR
@@ -135,6 +140,28 @@ Defaults:
 - `--state-dir`: `~/.comfy-moneta-bridge/`
 
 
+## Packages & provisioning
+
+Optional install extras (PyPI `[...]` groups):
+
+| Extra | Pulls | Enables |
+| --- | --- | --- |
+| `embeddings` | `sentence-transformers` (+ CPU torch) | real **BGE-small** semantic vectors — the default mode |
+| `agents` | `anthropic`, `mcp`, `httpx`, `websockets` | `bridge orchestrate` / `bridge mcp` |
+| `dev` | `pytest`, `pytest-asyncio`, `pytest-httpx`, `jsonschema` | the test suite |
+
+```sh
+pip install -e ".[embeddings]"          # real semantic embeddings (default mode)
+python -c "from comfy_moneta_bridge.vector import provision_model; provision_model()"
+```
+
+`provision_model()` is the **one sanctioned network call** — it downloads the
+BGE-small weights (~130 MB) into the local HuggingFace cache at install time.
+Ingest then loads strictly offline (`local_files_only`); a cache miss raises
+loudly rather than silently fetching (SPEC P4). A machine without the
+`embeddings` extra falls back to synthetic mode, which is network-free.
+
+
 ## What the bridge does
 
 ### Ingest path
@@ -149,9 +176,12 @@ Defaults:
 3. **Decodes** utf-8 explicitly per line, parses JSON, validates
    `schema_version == 1`.
 
-4. **Synthesizes** a deterministic 384-dim unit vector from the outcome's
-   `session` string (sha256 -> seeded `random.Random` -> gauss draws ->
-   L2-normalize). Stdlib only.
+4. **Embeds** the outcome content with `BAAI/bge-small-en-v1.5` (384-dim,
+   L2-normalized) — the default since the semantic-embeddings flip. Loaded
+   `local_files_only`, so ingest makes zero network calls.
+   `BRIDGE_EMBEDDER_MODE=synthetic` selects the legacy deterministic
+   session-keyed vector (sha256 -> seeded `random.Random` -> gauss draws ->
+   L2-normalize; stdlib only, network-free).
 
 5. **Opens** an ephemeral `Moneta(...)` handle, calls `deposit(payload,
    embedding)` and then `run_sleep_pass()` — the latter is mandatory for
@@ -177,7 +207,13 @@ Defaults:
    `vision_notes` -> notes type=`observation`; `key_params` +
    `quality_score` -> notes type=`preference`.
 
-6. **Atomic write** to `{comfy-cozy-root}/sessions/{name}.json`.
+6. **Folds in** (bge mode) the top-k semantically-related memories from
+   *other* sessions via `recall.py`, as `observation` notes naming their
+   origin session — no new capsule field, so Comfy-Cozy's loader is
+   untouched. Best-effort: a recall failure never blocks the write.
+   `cross_session_top_k=0` disables it.
+
+7. **Atomic write** to `{comfy-cozy-root}/sessions/{name}.json`.
 
 The capsule loads on Comfy-Cozy startup if `AUTO_LOAD_SESSION=<name>`
 is set. `bridge hydrate --launch` spawns Comfy-Cozy with that env.
@@ -254,12 +290,16 @@ If `~/.comfy-moneta-bridge/cursor.json` is deleted, replaying the JSONL
 produces duplicate Moneta deposits. Cursor durability is the v0
 idempotency mechanism; loss = some duplicates. *v1 candidate.*
 
-### Synthetic vectors
+### Synthetic vectors — RESOLVED
 
-v0 uses session-keyed deterministic vectors; there is no semantic
-similarity between distinct sessions. Same session retrieves all its
-memories; cross-session learning is not available. *v1 candidate: real
-embeddings (sentence-transformers or remote API).*
+Real semantic embeddings (`BAAI/bge-small-en-v1.5`, 384-dim) are now the
+**default**; `BRIDGE_EMBEDDER_MODE=synthetic` keeps the legacy session-keyed
+vectors as a network-free fallback. **Cross-session learning is now
+available** — `bridge hydrate` folds top-k semantically-related memories
+from other sessions into the capsule. Mixed-mode storage is safe: the
+`_embedder` tag keeps synthetic and bge vectors from contaminating each
+other's queries (a bge query never surfaces synthetic vectors). *Remaining
+v1 candidate: latency bench on target hardware before high-volume use.*
 
 ### Performance ceiling at WAL ≈ 1000
 
@@ -283,7 +323,7 @@ batched-deposit layer*.
 
 ```
 comfy_moneta_bridge/
-  vector.py            deterministic synthetic embedder + opt-in BGE
+  vector.py            BGE-small embedder (default) + synthetic fallback + provision_model
   state.py             CursorStore with atomic write + fsync
   tail.py              rotation-aware JSONL tailer
   ingest.py            deposit + run_sleep_pass pipeline
@@ -303,7 +343,7 @@ comfy_moneta_bridge/
     orchestrator.py    single-goal driver
     mcp_server.py      stdio MCP server
     loop.py            internal Anthropic-SDK Claude loop
-tests/                 250 tests (mocked + real-Moneta integration)
+tests/                 296 tests (mocked + real-Moneta integration)
 scripts/               Phase 0.5b probes (dimensionality, durability, benchmark)
 docs/architecture.md   longer-form architecture notes
 demo/                  workflow.json + shot_list.md for the demo arc

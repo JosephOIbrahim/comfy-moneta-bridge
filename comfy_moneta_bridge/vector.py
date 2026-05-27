@@ -1,11 +1,11 @@
 """Embedder layer: legacy synthetic + opt-in BGE-small content encoder.
 
-Phase 1 introduces a real semantic encoder behind a mode switch.
-``synthesize_vector`` (the deterministic PRNG-keyed embedder) remains
-the default and the legacy fallback. ``encode_outcome`` uses
-BAAI/bge-small-en-v1.5 to embed the outcome's content (workflow
-summary, vision notes, key params), giving Moneta retrieval a real
-semantic signal once ``BRIDGE_EMBEDDER_MODE=bge`` is set.
+Phase 1 introduces a real semantic encoder as the **default**.
+``encode_outcome`` uses BAAI/bge-small-en-v1.5 to embed the outcome's
+content (workflow summary, vision notes, key params), giving Moneta
+retrieval a real semantic signal by default. ``synthesize_vector``
+(the deterministic PRNG-keyed embedder) remains as the opt-in legacy
+fallback via ``BRIDGE_EMBEDDER_MODE=synthetic``.
 
 Phase 0.5b probe established Moneta accepts any positive-int
 dimensionality and locks it at first deposit. 384 is BGE-small's
@@ -14,8 +14,9 @@ written under one mode stays dim-compatible with the other (the
 embedding *meaning* changes, but the index does not need a rebuild).
 
 Mode is read from ``BRIDGE_EMBEDDER_MODE`` (``"synthetic"`` | ``"bge"``,
-default ``"synthetic"``). Anything unrecognised silently falls back to
-synthetic — synthetic is always safe.
+default ``"bge"`` since the semantic-embeddings flip). Anything
+unrecognised falls back to the default — set ``synthetic`` explicitly
+for the legacy, network-free path.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import os
 import random
 
 DIMENSION = 384
-DEFAULT_MODE = "synthetic"
+DEFAULT_MODE = "bge"
 ENV_VAR = "BRIDGE_EMBEDDER_MODE"
 BGE_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBEDDER_VERSION_SYNTHETIC = "synthetic-v0"
@@ -78,13 +79,33 @@ def current_embedder_version() -> str:
     return EMBEDDER_VERSION_SYNTHETIC
 
 
+def provision_model() -> str:
+    """Install-time provisioning: download BGE weights into the local HF cache.
+
+    This is the **only** sanctioned outbound network call in the embedder
+    layer (SPEC P4, Amendment A1: "weights provisioned at install time via
+    deterministic, verifiable cache"). Run once at install; ingest then loads
+    strictly offline via :func:`_get_bge_model`. Returns the model identifier.
+    """
+    from sentence_transformers import SentenceTransformer
+
+    SentenceTransformer(BGE_MODEL_NAME)  # downloads to HF cache if absent
+    return BGE_MODEL_NAME
+
+
 def _get_bge_model():
-    """Lazy-load the BGE-small model. Raises ImportError if extra absent."""
+    """Lazy-load the BGE-small model from the local cache only.
+
+    P4 guarantee: ingest makes no outbound network calls. ``local_files_only``
+    means a cache miss raises loudly (ImportError/OSError) rather than silently
+    fetching over the network — provisioning is :func:`provision_model`, an
+    explicit install-time step. Raises ImportError if the extra is absent.
+    """
     global _bge_model
     if _bge_model is None:
         from sentence_transformers import SentenceTransformer
 
-        _bge_model = SentenceTransformer(BGE_MODEL_NAME)
+        _bge_model = SentenceTransformer(BGE_MODEL_NAME, local_files_only=True)
     return _bge_model
 
 

@@ -123,9 +123,10 @@ def test_run_sleep_pass_called_after_deposit(tmp_path, patched_moneta) -> None:
     assert event_names == ["enter", "deposit", "sleep_pass", "exit"]
 
 
-def test_payload_is_full_json(tmp_path, patched_moneta) -> None:
+def test_payload_is_full_json(tmp_path, patched_moneta, monkeypatch) -> None:
     """Stored payload contains every original outcome field, plus the
-    embedder-version tag (default mode → synthetic-v0)."""
+    embedder-version tag (synthetic path → synthetic-v0)."""
+    monkeypatch.setenv(ENV_VAR, "synthetic")
     outcome = _outcome()
     ingest.ingest_outcome(outcome, tmp_path / "moneta")
     payload, _embedding = patched_moneta.instances[0].deposit_calls[0]
@@ -138,7 +139,8 @@ def test_payload_is_full_json(tmp_path, patched_moneta) -> None:
     assert set(parsed.keys()) - set(outcome.keys()) == {"_embedder"}
 
 
-def test_session_drives_embedding(tmp_path, patched_moneta) -> None:
+def test_session_drives_embedding(tmp_path, patched_moneta, monkeypatch) -> None:
+    monkeypatch.setenv(ENV_VAR, "synthetic")  # synthesize_vector path
     ingest.ingest_outcome(_outcome(session="alpha"), tmp_path / "moneta")
     ingest.ingest_outcome(_outcome(session="beta"), tmp_path / "moneta")
     ingest.ingest_outcome(_outcome(session="alpha"), tmp_path / "moneta")
@@ -201,7 +203,7 @@ def test_embedder_version_flips_with_env(
 
     monkeypatch.setattr(vector_mod, "_bge_model", _StubBGE())
 
-    monkeypatch.delenv(ENV_VAR, raising=False)
+    monkeypatch.setenv(ENV_VAR, "synthetic")
     ingest.ingest_outcome(_outcome(session="alpha"), tmp_path / "moneta")
 
     monkeypatch.setenv(ENV_VAR, "bge")

@@ -24,6 +24,8 @@ Schema translation:
     own the actual workflow JSON; ``bridge hydrate`` produces a capsule
     that loads with empty workflow state)
   - ``metadata`` records the hydration source and memory count
+  - cross-session semantic memories (SPEC P7) are folded in as
+    ``observation`` notes naming their origin session in the text
 """
 
 from __future__ import annotations
@@ -128,11 +130,87 @@ def _outcome_to_notes(outcome: dict, saved_at: str) -> list[dict]:
     return notes
 
 
+def _session_query_text(outcomes: list[dict]) -> str:
+    """Build a semantic query from a session's own recent outcomes.
+
+    Concatenates recent workflow summaries + vision notes so cross-session
+    recall lands on memories semantically related to what this session has
+    been doing. Empty if the session has no textual content to anchor on.
+    """
+    parts: list[str] = []
+    for o in outcomes[-3:]:
+        summary = o.get("workflow_summary")
+        if summary:
+            parts.append(str(summary))
+        for vn in o.get("vision_notes") or []:
+            if isinstance(vn, str):
+                parts.append(vn)
+    return " ".join(parts).strip()
+
+
+def _cross_session_notes(
+    session_name: str,
+    outcomes: list[dict],
+    moneta_storage_path: Path,
+    saved_at: str,
+    top_k: int,
+) -> list[dict]:
+    """Fold in top-k cross-session semantic memories (SPEC P7 / leaf L5).
+
+    Uses the session's own content as a query, retrieves semantically
+    related memories from OTHER sessions via ``recall`` (same embedder
+    mode + ``_embedder`` discipline), and renders them as schema_v2
+    ``observation`` notes with the origin session named in the text — no
+    new capsule field, so Comfy-Cozy's loader stays untouched.
+
+    Best-effort: any failure is logged and the capsule still writes with
+    its session-local notes.
+    """
+    query_text = _session_query_text(outcomes)
+    if not query_text:
+        return []
+
+    from comfy_moneta_bridge.recall import recall
+
+    try:
+        hits = recall(query_text, moneta_storage_path, top_k=top_k + 16)
+    except Exception as e:  # noqa: BLE001 — cross-session is non-critical
+        _logger.warning(
+            "write_capsule: cross-session recall failed (%s); capsule "
+            "continues with session-local notes only",
+            type(e).__name__,
+        )
+        return []
+
+    notes: list[dict] = []
+    seen: set[tuple] = set()
+    for h in hits:
+        sess = h.get("session")
+        if sess == session_name or h.get("_kind") == WORKFLOW_SNAPSHOT_KIND:
+            continue
+        summary = (h.get("workflow_summary") or "").strip()
+        key = (sess, summary)
+        if key in seen:
+            continue
+        seen.add(key)
+        notes.append(
+            {
+                "text": f"[related memory · session '{sess}'] {summary}".strip(),
+                "type": "observation",
+                "added_at": saved_at,
+            }
+        )
+        if len(notes) >= top_k:
+            break
+    return notes
+
+
 def write_capsule(
     session_name: str,
     comfy_cozy_root: Path,
     moneta_storage_path: Path,
     query_limit: int = 1000,
+    cross_session_top_k: int = 3,
 ) -> Path:
     """Build and atomically write ``sessions/{session_name}.json``.
 
@@ -214,6 +292,17 @@ def write_capsule(
     for outcome in outcomes:
         notes.extend(_outcome_to_notes(outcome, saved_at))
 
+    # SPEC P7 / leaf L5: fold in semantically-related memories from OTHER
+    # sessions so a freshly-hydrated session sees relevant cross-session
+    # context, not just its own history.
+    cross_notes: list[dict] = []
+    if cross_session_top_k > 0:
+        cross_notes = _cross_session_notes(
+            session_name, outcomes, moneta_storage_path, saved_at,
+            cross_session_top_k,
+        )
+        notes.extend(cross_notes)
+
     capsule = {
         "name": session_name,
         "saved_at": saved_at,
@@ -223,6 +312,7 @@ def write_capsule(
         "metadata": {
             "hydrated_from": "moneta",
             "memory_count": len(outcomes),
+            "cross_session_count": len(cross_notes),
         },
     }
 

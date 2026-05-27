@@ -31,6 +31,9 @@ from tests.test_capsule import (
 @pytest.fixture
 def patched_moneta(monkeypatch):
     CapsuleMonetaMock.reset()
+    # Synthetic-path snapshot unit tests; pin synthetic mode now that bge
+    # is the package default (leaf L4).
+    monkeypatch.setenv("BRIDGE_EMBEDDER_MODE", "synthetic")
     monkeypatch.setattr(
         "comfy_moneta_bridge.capsule.Moneta", CapsuleMonetaMock
     )
